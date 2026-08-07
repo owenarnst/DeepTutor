@@ -31,12 +31,18 @@ export default function CourseDetailPage() {
 
   if (error) {
     return (
-      <div className="flex h-full items-center justify-center p-8">
+      <div className="flex h-full items-center justify-center p-6 sm:p-8">
         <div className="max-w-md text-center">
-          <p className="text-sm text-rose-600 dark:text-rose-300">{error}</p>
+          <p
+            role="alert"
+            aria-live="assertive"
+            className="text-sm text-rose-600 dark:text-rose-300"
+          >
+            {error}
+          </p>
           <Link
             href="/courses"
-            className="mt-4 inline-block text-sm font-medium text-[var(--primary)]"
+            className="mt-4 inline-block rounded text-sm font-medium text-[var(--primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
           >
             {t('Back to courses')}
           </Link>
@@ -47,7 +53,11 @@ export default function CourseDetailPage() {
 
   if (!course) {
     return (
-      <div className="flex h-full items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex h-full items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]"
+      >
         <Loader2 size={16} className="animate-spin" />
         {t('Loading course…')}
       </div>
@@ -57,10 +67,10 @@ export default function CourseDetailPage() {
   const unit = course.units[0]
   return (
     <div className="h-full overflow-y-auto bg-[var(--background)]">
-      <div className="mx-auto max-w-5xl px-6 py-8 lg:px-10">
+      <div className="mx-auto max-w-5xl px-4 py-6 sm:px-6 sm:py-8 lg:px-10">
         <Link
           href="/courses"
-          className="mb-7 inline-flex items-center gap-2 text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+          className="mb-7 inline-flex items-center gap-2 rounded text-sm text-[var(--muted-foreground)] hover:text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
         >
           <ArrowLeft size={15} />
           {t('All courses')}
@@ -84,11 +94,17 @@ export default function CourseDetailPage() {
         </header>
 
         <div className="mt-6 grid gap-5 lg:grid-cols-[1.35fr_1fr]">
-          <section className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5">
-            <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-[var(--foreground)]">
+          <section
+            aria-labelledby="course-outline-heading"
+            className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5"
+          >
+            <h2
+              id="course-outline-heading"
+              className="mb-4 flex items-center gap-2 text-sm font-semibold text-[var(--foreground)]"
+            >
               <BookOpen size={16} />
               {t('Course outline')}
-            </div>
+            </h2>
             <div className="rounded-xl border border-[var(--border)] bg-[var(--secondary)]/25 p-4">
               <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--muted-foreground)]">
                 {t('Unit 1')}
@@ -104,11 +120,13 @@ export default function CourseDetailPage() {
 
           <div className="grid gap-5">
             <Placeholder
+              id="mastery-heading"
               icon={<Target size={17} />}
               title={t('Mastery')}
               text={t('Mastery evidence will appear after learning begins.')}
             />
             <Placeholder
+              id="schedule-heading"
               icon={<CalendarClock size={17} />}
               title={t('Schedule')}
               text={t('No sessions or reviews are scheduled yet.')}
@@ -121,20 +139,28 @@ export default function CourseDetailPage() {
 }
 
 function Placeholder({
+  id,
   icon,
   title,
   text,
 }: {
+  id: string
   icon: React.ReactNode
   title: string
   text: string
 }) {
   return (
-    <section className="rounded-2xl border border-dashed border-[var(--border)] bg-[var(--card)]/60 p-5">
-      <div className="flex items-center gap-2 text-sm font-semibold text-[var(--foreground)]">
+    <section
+      aria-labelledby={id}
+      className="rounded-2xl border border-dashed border-[var(--border)] bg-[var(--card)]/60 p-5"
+    >
+      <h2
+        id={id}
+        className="flex items-center gap-2 text-sm font-semibold text-[var(--foreground)]"
+      >
         {icon}
         {title}
-      </div>
+      </h2>
       <p className="mt-2 text-xs leading-5 text-[var(--muted-foreground)]">{text}</p>
     </section>
   )

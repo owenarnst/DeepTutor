@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Response, status
+from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from deeptutor.course_mode.models import Course
 from deeptutor.course_mode.repository import (
+    DEFAULT_COURSE_LIST_LIMIT,
+    MAX_COURSE_LIST_LIMIT,
+    MAX_COURSE_LIST_OFFSET,
     CourseInput,
+    CourseQuotaExceededError,
     CourseRepository,
     IdempotencyConflictError,
     InvalidCourseIdentifierError,
@@ -18,6 +23,7 @@ from deeptutor.course_mode.repository import (
 )
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.multi_user.paths import get_current_path_service
+from deeptutor.services.config.runtime_settings import load_system_settings
 
 router = APIRouter()
 
@@ -54,7 +60,12 @@ class CourseListResponse(BaseModel):
 
 def get_course_repository() -> CourseRepository:
     user = get_current_user()
-    return CourseRepository(get_current_path_service(), owner_scope=user.id)
+    max_courses = load_system_settings()["course_max_per_owner"]
+    return CourseRepository(
+        get_current_path_service(),
+        owner_scope=user.id,
+        max_courses=max_courses,
+    )
 
 
 @router.post("", response_model=CreateCourseResponse)
@@ -65,7 +76,8 @@ async def create_course(
 ) -> CreateCourseResponse:
     repository = get_course_repository()
     try:
-        result = repository.create_draft(
+        result = await asyncio.to_thread(
+            repository.create_draft,
             idempotency_key,
             CourseInput(
                 title=body.title,
@@ -79,19 +91,27 @@ async def create_course(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+    except CourseQuotaExceededError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     return CreateCourseResponse(course=result.course, created=result.created)
 
 
 @router.get("", response_model=CourseListResponse)
-async def list_courses() -> CourseListResponse:
-    return CourseListResponse(courses=get_course_repository().list())
+async def list_courses(
+    limit: Annotated[int, Query(ge=1, le=MAX_COURSE_LIST_LIMIT)] = (DEFAULT_COURSE_LIST_LIMIT),
+    offset: Annotated[int, Query(ge=0, le=MAX_COURSE_LIST_OFFSET)] = 0,
+) -> CourseListResponse:
+    repository = get_course_repository()
+    courses = await asyncio.to_thread(repository.list, limit=limit, offset=offset)
+    return CourseListResponse(courses=courses)
 
 
 @router.get("/{course_id}", response_model=CourseResponse)
 async def get_course(course_id: str) -> CourseResponse:
+    repository = get_course_repository()
     try:
-        course = get_course_repository().get(course_id)
+        course = await asyncio.to_thread(repository.get, course_id)
     except InvalidCourseIdentifierError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid course id"

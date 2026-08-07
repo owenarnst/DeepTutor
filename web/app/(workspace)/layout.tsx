@@ -11,9 +11,11 @@ export default function WorkspaceLayout({
   return (
     <CapabilityAccessProvider>
       <UnifiedChatProvider>
-        <div className="flex h-screen overflow-hidden">
-          <WorkspaceSidebar />
-          <main className="flex-1 overflow-hidden bg-[var(--background)]">
+        <div className="flex h-screen min-w-0 overflow-hidden">
+          <div className="hidden shrink-0 sm:block">
+            <WorkspaceSidebar />
+          </div>
+          <main className="min-w-0 flex-1 overflow-hidden bg-[var(--background)]">
             <CapabilityGate>{children}</CapabilityGate>
           </main>
         </div>

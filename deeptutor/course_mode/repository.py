@@ -17,8 +17,12 @@ from deeptutor.services.path_service import PathService
 
 from .models import Course, CourseStatus, Unit
 
-_LATEST_SCHEMA_VERSION = 2
+_LATEST_SCHEMA_VERSION = 3
 _REQUEST_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+DEFAULT_MAX_COURSES_PER_OWNER = 200
+DEFAULT_COURSE_LIST_LIMIT = 50
+MAX_COURSE_LIST_LIMIT = 100
+MAX_COURSE_LIST_OFFSET = 10_000
 
 
 class CourseModeError(Exception):
@@ -38,6 +42,10 @@ class InvalidCourseInputError(CourseModeError, ValueError):
 
 
 class IdempotencyConflictError(CourseModeError):
+    pass
+
+
+class CourseQuotaExceededError(CourseModeError):
     pass
 
 
@@ -106,11 +114,20 @@ def _validate_course_id(course_id: str) -> str:
 class CourseRepository:
     """One repository instance serves exactly one server-derived user scope."""
 
-    def __init__(self, path_service: PathService, *, owner_scope: str):
+    def __init__(
+        self,
+        path_service: PathService,
+        *,
+        owner_scope: str,
+        max_courses: int = DEFAULT_MAX_COURSES_PER_OWNER,
+    ):
         if not owner_scope:
             raise ValueError("owner_scope is required")
+        if not 1 <= max_courses <= 10_000:
+            raise ValueError("max_courses must be between 1 and 10000")
         self.path_service = path_service
         self.owner_scope = owner_scope
+        self.max_courses = max_courses
         self.db_path = path_service.get_course_mode_db()
 
     @contextmanager
@@ -127,8 +144,18 @@ class CourseRepository:
 
     def initialize(self) -> None:
         with self._connect() as conn:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version == _LATEST_SCHEMA_VERSION:
+                return
+            if version > _LATEST_SCHEMA_VERSION:
+                raise UnsupportedSchemaVersionError(
+                    f"Course Mode database schema {version} is newer than supported"
+                )
+
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # Another process may have completed migration while this
+                # connection waited for the write lease.
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 if version > _LATEST_SCHEMA_VERSION:
                     raise UnsupportedSchemaVersionError(
@@ -141,6 +168,10 @@ class CourseRepository:
                 if version < 2:
                     self._migrate_to_v2(conn)
                     conn.execute("PRAGMA user_version = 2")
+                    version = 2
+                if version < 3:
+                    self._migrate_to_v3(conn)
+                    conn.execute("PRAGMA user_version = 3")
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -247,6 +278,52 @@ class CourseRepository:
         for statement in statements:
             conn.execute(statement)
 
+    @staticmethod
+    def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_units_course_id_id ON units(course_id, id)"
+        )
+        conn.execute("ALTER TABLE artifact_references RENAME TO artifact_references_v2")
+        conn.execute(
+            """
+            CREATE TABLE artifact_references (
+                id TEXT PRIMARY KEY,
+                course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE RESTRICT,
+                unit_id TEXT,
+                kind TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(course_id, relative_path),
+                FOREIGN KEY(course_id, unit_id)
+                    REFERENCES units(course_id, id) ON DELETE RESTRICT,
+                CHECK(length(relative_path) > 0),
+                CHECK(instr(relative_path, char(0)) = 0),
+                CHECK(instr(relative_path, '\\') = 0),
+                CHECK(substr(relative_path, 1, 1) != '/'),
+                CHECK(NOT (
+                    substr(relative_path, 1, 1) GLOB '[A-Za-z]'
+                    AND substr(relative_path, 2, 1) = ':'
+                )),
+                CHECK(relative_path NOT IN ('.', '..')),
+                CHECK(instr('/' || relative_path || '/', '/./') = 0),
+                CHECK(instr('/' || relative_path || '/', '/../') = 0),
+                CHECK(instr(relative_path, '//') = 0),
+                CHECK(substr(relative_path, -1, 1) != '/')
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO artifact_references(
+                id, course_id, unit_id, kind, relative_path, content_hash, created_at
+            )
+            SELECT id, course_id, unit_id, kind, relative_path, content_hash, created_at
+            FROM artifact_references_v2
+            """
+        )
+        conn.execute("DROP TABLE artifact_references_v2")
+
     def create_draft(self, request_key: str, course_input: CourseInput) -> CreateCourseResult:
         if not _REQUEST_KEY_RE.fullmatch(request_key):
             raise InvalidRequestKeyError("Idempotency key must be 1-128 URL-safe characters")
@@ -277,6 +354,17 @@ class CourseRepository:
                         raise RuntimeError("Idempotency record references a missing course")
                     conn.commit()
                     return CreateCourseResult(course=course, created=False)
+
+                current_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM courses WHERE owner_scope = ?",
+                        (self.owner_scope,),
+                    ).fetchone()[0]
+                )
+                if current_count >= self.max_courses:
+                    raise CourseQuotaExceededError(
+                        f"Course limit reached ({self.max_courses} per owner)"
+                    )
 
                 course_id = str(uuid4())
                 unit_id = str(uuid4())
@@ -348,20 +436,56 @@ class CourseRepository:
                         pass
                 raise
 
-    def list(self) -> list[Course]:
+    def list(
+        self,
+        *,
+        limit: int = DEFAULT_COURSE_LIST_LIMIT,
+        offset: int = 0,
+    ) -> list[Course]:
+        if not 1 <= limit <= MAX_COURSE_LIST_LIMIT:
+            raise ValueError(f"limit must be between 1 and {MAX_COURSE_LIST_LIMIT}")
+        if not 0 <= offset <= MAX_COURSE_LIST_OFFSET:
+            raise ValueError(f"offset must be between 0 and {MAX_COURSE_LIST_OFFSET}")
         self.initialize()
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id FROM courses
-                WHERE owner_scope = ?
-                ORDER BY updated_at DESC, id DESC
+                SELECT
+                    c.id, c.title, c.description, c.status, c.workspace_ref,
+                    c.created_at, c.updated_at,
+                    u.id AS unit_id, u.title AS unit_title, u.position AS unit_position
+                FROM courses AS c
+                LEFT JOIN units AS u ON u.course_id = c.id
+                WHERE c.owner_scope = ?
+                ORDER BY c.updated_at DESC, c.id DESC
+                LIMIT ? OFFSET ?
                 """,
-                (self.owner_scope,),
+                (self.owner_scope, limit, offset),
             ).fetchall()
-            return [
-                course for row in rows if (course := self._get_with_connection(conn, row["id"]))
-            ]
+            return [self._course_from_list_row(row) for row in rows]
+
+    @staticmethod
+    def _course_from_list_row(row: sqlite3.Row) -> Course:
+        units: tuple[Unit, ...] = ()
+        if row["unit_id"] is not None:
+            units = (
+                Unit(
+                    id=row["unit_id"],
+                    course_id=row["id"],
+                    title=row["unit_title"],
+                    position=row["unit_position"],
+                ),
+            )
+        return Course(
+            id=row["id"],
+            title=row["title"],
+            description=row["description"],
+            status=CourseStatus(row["status"]),
+            workspace_ref=row["workspace_ref"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            units=units,
+        )
 
     def get(self, course_id: str) -> Course | None:
         canonical = _validate_course_id(course_id)
@@ -393,7 +517,12 @@ class CourseRepository:
 
 
 __all__ = [
+    "DEFAULT_COURSE_LIST_LIMIT",
+    "DEFAULT_MAX_COURSES_PER_OWNER",
+    "MAX_COURSE_LIST_LIMIT",
+    "MAX_COURSE_LIST_OFFSET",
     "CourseInput",
+    "CourseQuotaExceededError",
     "CourseRepository",
     "CreateCourseResult",
     "IdempotencyConflictError",

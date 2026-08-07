@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
 
@@ -8,7 +9,10 @@ import pytest
 
 from deeptutor.course_mode.models import CourseStatus
 from deeptutor.course_mode.repository import (
+    DEFAULT_COURSE_LIST_LIMIT,
+    MAX_COURSE_LIST_LIMIT,
     CourseInput,
+    CourseQuotaExceededError,
     CourseRepository,
     IdempotencyConflictError,
     InvalidCourseIdentifierError,
@@ -147,7 +151,7 @@ def test_initializes_an_existing_empty_database(paths: PathService) -> None:
     CourseRepository(paths, owner_scope="user-a").initialize()
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         tables = {
             row[0]
             for row in conn.execute(
@@ -216,7 +220,7 @@ def test_migrates_an_older_schema_without_losing_courses(paths: PathService) -> 
     assert existing.title == "Existing"
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_references)")}
         assert "relative_path" in columns
         assert "body" not in columns
@@ -255,3 +259,58 @@ def test_separate_path_services_are_isolated(tmp_path: Path) -> None:
     assert alice.get(bob_course.id) is None
     assert [course.title for course in alice.list()] == ["Alice course"]
     assert [course.title for course in bob.list()] == ["Bob course"]
+
+
+def test_course_quota_is_transactional_and_replay_succeeds_at_limit(
+    paths: PathService,
+) -> None:
+    repository = CourseRepository(paths, owner_scope="user-a", max_courses=2)
+    first = repository.create_draft("course-1", CourseInput(title="One"))
+    repository.create_draft("course-2", CourseInput(title="Two"))
+
+    with pytest.raises(CourseQuotaExceededError, match="2"):
+        repository.create_draft("course-3", CourseInput(title="Three"))
+
+    replay = repository.create_draft("course-1", CourseInput(title="One"))
+    assert replay.created is False
+    assert replay.course.id == first.course.id
+
+
+def test_list_is_bounded_and_validates_pagination(repository: CourseRepository) -> None:
+    for index in range(5):
+        repository.create_draft(f"course-{index}", CourseInput(title=f"Course {index}"))
+
+    assert len(repository.list(limit=2)) == 2
+    assert len(repository.list(limit=2, offset=2)) == 2
+    assert len(repository.list()) <= DEFAULT_COURSE_LIST_LIMIT
+    with pytest.raises(ValueError):
+        repository.list(limit=MAX_COURSE_LIST_LIMIT + 1)
+    with pytest.raises(ValueError):
+        repository.list(offset=-1)
+
+
+def test_current_schema_reads_do_not_open_write_transactions_or_run_n_plus_one_queries(
+    repository: CourseRepository, monkeypatch
+) -> None:
+    repository.create_draft("course-1", CourseInput(title="One"))
+    repository.create_draft("course-2", CourseInput(title="Two"))
+    statements: list[str] = []
+    original_connect = repository._connect
+
+    @contextmanager
+    def traced_connect():
+        with original_connect() as conn:
+            conn.set_trace_callback(statements.append)
+            yield conn
+
+    monkeypatch.setattr(repository, "_connect", traced_connect)
+    assert len(repository.list()) == 2
+
+    normalized = [statement.strip().upper() for statement in statements]
+    assert not any(statement.startswith("BEGIN IMMEDIATE") for statement in normalized)
+    data_selects = [
+        statement
+        for statement in normalized
+        if statement.startswith("SELECT") and " FROM COURSES" in statement
+    ]
+    assert len(data_selects) == 1

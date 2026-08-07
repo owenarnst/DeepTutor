@@ -39,6 +39,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
     "chat_attachment_max_total_mb": 25,
     "chat_attachment_max_chars_per_doc": 200_000,
     "chat_attachment_max_chars_total": 150_000,
+    "course_max_per_owner": 200,
 }
 
 # Clamp bounds for the chat attachment knobs. The MB ceilings are deliberately
@@ -47,6 +48,7 @@ DEFAULT_SYSTEM_SETTINGS: dict[str, Any] = {
 CHAT_ATTACHMENT_MAX_FILE_MB_RANGE = (1, 1024)
 CHAT_ATTACHMENT_MAX_TOTAL_MB_RANGE = (1, 2048)
 CHAT_ATTACHMENT_CHARS_RANGE = (10_000, 5_000_000)
+COURSE_MAX_PER_OWNER_RANGE = (1, 10_000)
 
 DEFAULT_AUTH_SETTINGS: dict[str, Any] = {
     "version": 1,
@@ -633,6 +635,8 @@ class RuntimeSettingsService:
             payload["chat_attachment_max_chars_per_doc"] = value
         if value := self._process_env_value("CHAT_ATTACHMENT_MAX_CHARS_TOTAL"):
             payload["chat_attachment_max_chars_total"] = value
+        if value := self._process_env_value("DEEPTUTOR_COURSE_MAX_PER_OWNER"):
+            payload["course_max_per_owner"] = value
         return self._normalize_system(payload)
 
     def _apply_auth_process_overrides(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -904,6 +908,11 @@ class RuntimeSettingsService:
                 DEFAULT_SYSTEM_SETTINGS["chat_attachment_max_chars_total"],
                 *CHAT_ATTACHMENT_CHARS_RANGE,
             ),
+            "course_max_per_owner": _coerce_clamped_int(
+                settings.get("course_max_per_owner"),
+                DEFAULT_SYSTEM_SETTINGS["course_max_per_owner"],
+                *COURSE_MAX_PER_OWNER_RANGE,
+            ),
         }
 
     def _normalize_auth(self, settings: dict[str, Any]) -> dict[str, Any]:
@@ -1046,6 +1055,7 @@ __all__ = [
     "CHAT_ATTACHMENT_CHARS_RANGE",
     "CHAT_ATTACHMENT_MAX_FILE_MB_RANGE",
     "CHAT_ATTACHMENT_MAX_TOTAL_MB_RANGE",
+    "COURSE_MAX_PER_OWNER_RANGE",
     "DEFAULT_AUTH_SETTINGS",
     "DEFAULT_DOCUMENT_PARSING_SETTINGS",
     "DEFAULT_GRAPHRAG_SETTINGS",

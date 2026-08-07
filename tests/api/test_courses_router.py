@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import time
+
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
@@ -132,3 +135,83 @@ def test_missing_foreign_and_traversal_ids_do_not_leak(course_client: TestClient
     assert traversal.status_code in {400, 404}
 
     assert course_client.get("/api/v1/courses", headers=_auth("bob")).json() == {"courses": []}
+
+
+def test_course_list_is_paginated_and_bounded(course_client: TestClient) -> None:
+    for index in range(3):
+        response = course_client.post(
+            "/api/v1/courses",
+            headers={**_auth(), "Idempotency-Key": f"page-{index}"},
+            json={"title": f"Course {index}"},
+        )
+        assert response.status_code == 201
+
+    page = course_client.get(
+        "/api/v1/courses?limit=1&offset=1",
+        headers=_auth(),
+    )
+    assert page.status_code == 200
+    assert len(page.json()["courses"]) == 1
+    assert course_client.get("/api/v1/courses?limit=101", headers=_auth()).status_code == 422
+    assert course_client.get("/api/v1/courses?offset=10001", headers=_auth()).status_code == 422
+
+
+def test_quota_rejects_new_course_but_allows_replay_at_limit(
+    course_client: TestClient,
+    monkeypatch,
+) -> None:
+    from deeptutor.api.routers import courses as courses_router
+
+    monkeypatch.setattr(
+        courses_router,
+        "load_system_settings",
+        lambda: {"course_max_per_owner": 2},
+    )
+    first_headers = {**_auth(), "Idempotency-Key": "quota-first"}
+    first = course_client.post("/api/v1/courses", headers=first_headers, json={"title": "First"})
+    second = course_client.post(
+        "/api/v1/courses",
+        headers={**_auth(), "Idempotency-Key": "quota-second"},
+        json={"title": "Second"},
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+
+    exhausted = course_client.post(
+        "/api/v1/courses",
+        headers={**_auth(), "Idempotency-Key": "quota-third"},
+        json={"title": "Third"},
+    )
+    assert exhausted.status_code == 409
+    assert exhausted.json()["detail"] == "Course limit reached (2 per owner)"
+
+    replay = course_client.post("/api/v1/courses", headers=first_headers, json={"title": "First"})
+    assert replay.status_code == 200
+    assert replay.json()["created"] is False
+    assert replay.json()["course"]["id"] == first.json()["course"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_list_moves_blocking_repository_work_off_event_loop(monkeypatch) -> None:
+    from deeptutor.api.routers import courses as courses_router
+
+    class SlowRepository:
+        def list(self, *, limit: int, offset: int):
+            assert (limit, offset) == (50, 0)
+            time.sleep(0.05)
+            return []
+
+    monkeypatch.setattr(courses_router, "get_course_repository", SlowRepository)
+    heartbeat_ran = False
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ran
+        await asyncio.sleep(0.005)
+        heartbeat_ran = True
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    response = await courses_router.list_courses(limit=50, offset=0)
+    await heartbeat_task
+
+    assert response.courses == []
+    assert heartbeat_ran is True

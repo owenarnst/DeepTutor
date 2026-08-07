@@ -96,7 +96,7 @@ export default function CoursesPage() {
 
   return (
     <div className="h-full overflow-y-auto bg-[var(--background)]">
-      <div className="mx-auto max-w-6xl px-6 py-8 lg:px-10">
+      <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 lg:px-10">
         <header className="mb-8 flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
           <div>
             <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-[var(--primary)]">
@@ -113,14 +113,16 @@ export default function CoursesPage() {
           <button
             type="button"
             onClick={() => setShowCreate(open => !open)}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--primary)] px-4 text-sm font-medium text-[var(--primary-foreground)] shadow-sm transition-opacity hover:opacity-90"
+            aria-expanded={showCreate}
+            aria-controls="new-course-form"
+            className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--primary)] px-4 text-sm font-medium text-[var(--primary-foreground)] shadow-sm transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
           >
             <Plus size={16} />
             {t('New course')}
           </button>
         </header>
 
-        <section className="mb-7 grid gap-3 sm:grid-cols-3">
+        <section aria-label={t('Course Mode')} className="mb-7 grid gap-3 sm:grid-cols-3">
           <Metric icon={<BookOpen size={16} />} label={t('Courses')} value={courses.length} />
           <Metric icon={<Sparkles size={16} />} label={t('Drafts')} value={draftCount} />
           <Metric icon={<Target size={16} />} label={t('Mastery tracking')} value="—" />
@@ -128,6 +130,7 @@ export default function CoursesPage() {
 
         {showCreate && (
           <form
+            id="new-course-form"
             onSubmit={handleCreate}
             className="mb-8 grid gap-4 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-sm"
           >
@@ -146,7 +149,7 @@ export default function CoursesPage() {
                 maxLength={200}
                 value={title}
                 onChange={event => setTitle(event.target.value)}
-                className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus:border-[var(--primary)]"
+                className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30"
                 placeholder={t('e.g. Foundations of statistics')}
               />
             </label>
@@ -158,7 +161,7 @@ export default function CoursesPage() {
                   maxLength={200}
                   value={unitTitle}
                   onChange={event => setUnitTitle(event.target.value)}
-                  className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus:border-[var(--primary)]"
+                  className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30"
                 />
               </label>
               <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
@@ -167,7 +170,7 @@ export default function CoursesPage() {
                   maxLength={2000}
                   value={description}
                   onChange={event => setDescription(event.target.value)}
-                  className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus:border-[var(--primary)]"
+                  className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30"
                   placeholder={t('What do you want to learn?')}
                 />
               </label>
@@ -179,7 +182,7 @@ export default function CoursesPage() {
               <button
                 type="submit"
                 disabled={creating}
-                className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] disabled:opacity-50"
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2 disabled:opacity-50"
               >
                 {creating && <Loader2 size={14} className="animate-spin" />}
                 {t('Create draft')}
@@ -191,6 +194,7 @@ export default function CoursesPage() {
         {error && (
           <div
             role="alert"
+            aria-live="assertive"
             className="mb-5 rounded-lg border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300"
           >
             {error}
@@ -198,14 +202,14 @@ export default function CoursesPage() {
         )}
 
         {loading ? (
-          <div className="flex items-center justify-center gap-2 py-20 text-sm text-[var(--muted-foreground)]">
+          <div role="status" aria-live="polite" className="flex items-center justify-center gap-2 py-20 text-sm text-[var(--muted-foreground)]">
             <Loader2 size={16} className="animate-spin" /> {t('Loading courses…')}
           </div>
         ) : courses.length === 0 ? (
           <button
             type="button"
             onClick={() => setShowCreate(true)}
-            className="flex w-full flex-col items-center rounded-2xl border border-dashed border-[var(--border)] px-6 py-16 text-center transition-colors hover:bg-[var(--secondary)]/30"
+            className="flex w-full flex-col items-center rounded-2xl border border-dashed border-[var(--border)] px-6 py-16 text-center transition-colors hover:bg-[var(--secondary)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
           >
             <GraduationCap size={30} className="mb-3 text-[var(--primary)]" />
             <span className="font-medium text-[var(--foreground)]">
@@ -221,7 +225,7 @@ export default function CoursesPage() {
               <Link
                 key={course.id}
                 href={`/courses/${encodeURIComponent(course.id)}`}
-                className="group rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:border-[var(--primary)]/40 hover:shadow-md"
+                className="group min-w-0 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:border-[var(--primary)]/40 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
               >
                 <div className="mb-6 flex items-start justify-between gap-4">
                   <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
@@ -237,7 +241,7 @@ export default function CoursesPage() {
                   {course.description || t('No description yet.')}
                 </p>
                 <div className="mt-5 flex items-center justify-between border-t border-[var(--border)] pt-4 text-xs text-[var(--muted-foreground)]">
-                  <span className="flex items-center gap-1.5">
+                  <span className="flex min-w-0 items-center gap-1.5 truncate">
                     <BookOpen size={13} />
                     {course.units[0]?.title}
                   </span>
