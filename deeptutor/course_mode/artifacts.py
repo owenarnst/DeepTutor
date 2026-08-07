@@ -18,7 +18,6 @@ from pathlib import Path
 import re
 import stat
 from typing import BinaryIO, Iterator
-from uuid import uuid4
 
 from deeptutor.services.path_service import PathService
 
@@ -38,10 +37,6 @@ class InvalidArtifactPathError(ValueError):
 
 class UnsupportedCourseStorageError(RuntimeError):
     """Raised when the platform cannot provide race-safe Course filesystem access."""
-
-
-class CourseStorageMigrationError(RuntimeError):
-    """Raised when legacy Course storage cannot be moved without ambiguity."""
 
 
 def _require_handle_relative_storage() -> None:
@@ -194,223 +189,6 @@ def _open_existing_directory_chain(anchor: Path, components: tuple[str, ...]) ->
     return current_fd
 
 
-def _try_open_existing_directory_chain(
-    anchor: Path,
-    components: tuple[str, ...],
-) -> int | None:
-    """Open a no-follow directory chain, returning ``None`` when it is absent."""
-    current_fd = os.open(anchor, _directory_flags())
-    try:
-        for component in components:
-            try:
-                child_fd = os.open(component, _directory_flags(), dir_fd=current_fd)
-            except FileNotFoundError:
-                os.close(current_fd)
-                return None
-            os.close(current_fd)
-            current_fd = child_fd
-    except OSError as exc:
-        os.close(current_fd)
-        raise InvalidArtifactPathError(
-            "Legacy Course storage contains a symlink or reparse point"
-        ) from exc
-    return current_fd
-
-
-def _open_migration_entry(parent_fd: int, name: str, *, directory: bool) -> int | None:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    if directory:
-        flags |= getattr(os, "O_DIRECTORY", 0)
-    try:
-        entry_fd = os.open(name, flags, dir_fd=parent_fd)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise CourseStorageMigrationError(
-            "Legacy Course storage entry is not safe to migrate"
-        ) from exc
-    metadata = os.fstat(entry_fd)
-    expected = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
-    if not expected:
-        os.close(entry_fd)
-        raise CourseStorageMigrationError("Legacy Course storage entry has an invalid type")
-    return entry_fd
-
-
-def _move_legacy_entry(
-    source_parent_fd: int,
-    source_name: str,
-    destination_parent_fd: int,
-    destination_name: str,
-    *,
-    directory: bool,
-) -> None:
-    """Atomically move one legacy entry and prove the held inode was moved."""
-    source_fd = _open_migration_entry(source_parent_fd, source_name, directory=directory)
-    if source_fd is None:
-        return
-    try:
-        destination_fd = _open_migration_entry(
-            destination_parent_fd,
-            destination_name,
-            directory=directory,
-        )
-        if destination_fd is not None:
-            os.close(destination_fd)
-            raise CourseStorageMigrationError(
-                "Legacy and private Course storage both exist; refusing to overwrite"
-            )
-        source_identity = os.fstat(source_fd)
-        try:
-            os.rename(
-                source_name,
-                destination_name,
-                src_dir_fd=source_parent_fd,
-                dst_dir_fd=destination_parent_fd,
-            )
-        except FileNotFoundError:
-            # Another trusted request may have completed the same atomic move.
-            _verify_moved_migration_entry(
-                source_identity,
-                destination_parent_fd,
-                destination_name,
-                source_parent_fd,
-                source_name,
-                directory=directory,
-                missing_message="Legacy Course storage changed during migration",
-                mismatch_message="Legacy Course storage changed during concurrent migration",
-            )
-            return
-        except OSError as exc:
-            raise CourseStorageMigrationError("Could not move legacy Course storage") from exc
-
-        _verify_moved_migration_entry(
-            source_identity,
-            destination_parent_fd,
-            destination_name,
-            source_parent_fd,
-            source_name,
-            directory=directory,
-            missing_message="Legacy Course storage disappeared during migration",
-            mismatch_message="Legacy Course storage was replaced during migration",
-        )
-    finally:
-        os.close(source_fd)
-
-
-def _verify_moved_migration_entry(
-    source_identity: os.stat_result,
-    destination_parent_fd: int,
-    destination_name: str,
-    legacy_parent_fd: int,
-    legacy_name: str,
-    *,
-    directory: bool,
-    missing_message: str,
-    mismatch_message: str,
-) -> None:
-    """Verify an atomic migration moved the exact entry held by the caller."""
-    moved_fd = _open_migration_entry(
-        destination_parent_fd,
-        destination_name,
-        directory=directory,
-    )
-    if moved_fd is None:
-        raise CourseStorageMigrationError(missing_message)
-    try:
-        moved_identity = os.fstat(moved_fd)
-        if (source_identity.st_dev, source_identity.st_ino) != (
-            moved_identity.st_dev,
-            moved_identity.st_ino,
-        ):
-            _quarantine_migration_destination(
-                destination_parent_fd,
-                destination_name,
-                legacy_parent_fd,
-                legacy_name,
-            )
-            raise CourseStorageMigrationError(mismatch_message)
-    finally:
-        os.close(moved_fd)
-
-
-def _quarantine_migration_destination(
-    destination_parent_fd: int,
-    destination_name: str,
-    legacy_parent_fd: int,
-    legacy_name: str,
-) -> None:
-    """Move an unverified raced entry back out of server-private storage."""
-    quarantine_name = f".{legacy_name}.migration-rejected-{uuid4()}"
-    try:
-        os.rename(
-            destination_name,
-            quarantine_name,
-            src_dir_fd=destination_parent_fd,
-            dst_dir_fd=legacy_parent_fd,
-        )
-    except OSError as exc:
-        raise CourseStorageMigrationError(
-            "Could not quarantine replaced legacy Course storage"
-        ) from exc
-
-
-def migrate_legacy_course_storage(path_service: PathService) -> None:
-    """Move pre-private Course DB/workspace paths into tenant-private storage.
-
-    Migration is atomic per top-level entry, never overwrites a destination,
-    and holds source/destination directory handles throughout each rename. A
-    repeated call is a no-op because the legacy names no longer exist.
-    """
-    anchor = _prepare_trusted_anchor(path_service)
-    ensure_course_data_root(path_service)
-    try:
-        scope_components = path_service.workspace_root.relative_to(anchor).parts
-    except ValueError as exc:
-        raise CourseStorageMigrationError(
-            "Legacy Course storage is outside the trusted data anchor"
-        ) from exc
-
-    destination_fd = _open_existing_directory_chain(
-        anchor,
-        _course_storage_components(path_service),
-    )
-    try:
-        legacy_user_fd = _try_open_existing_directory_chain(
-            anchor,
-            (*scope_components, "user"),
-        )
-        if legacy_user_fd is not None:
-            try:
-                _move_legacy_entry(
-                    legacy_user_fd,
-                    "course_mode.db",
-                    destination_fd,
-                    "course_mode.db",
-                    directory=False,
-                )
-            finally:
-                os.close(legacy_user_fd)
-
-        legacy_workspace_fd = _try_open_existing_directory_chain(
-            anchor,
-            (*scope_components, "user", "workspace"),
-        )
-        if legacy_workspace_fd is not None:
-            try:
-                _move_legacy_entry(
-                    legacy_workspace_fd,
-                    "course-mode",
-                    destination_fd,
-                    "workspace",
-                    directory=True,
-                )
-            finally:
-                os.close(legacy_workspace_fd)
-    finally:
-        os.close(destination_fd)
-
-
 @contextmanager
 def open_course_artifact_for_read(
     path_service: PathService,
@@ -447,12 +225,10 @@ def open_course_artifact_for_read(
 
 
 __all__ = [
-    "CourseStorageMigrationError",
     "InvalidArtifactPathError",
     "UnsupportedCourseStorageError",
     "ensure_course_data_root",
     "ensure_course_workspace",
-    "migrate_legacy_course_storage",
     "normalize_artifact_relative_path",
     "open_course_artifact_for_read",
     "remove_empty_course_workspace",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import time
 
 from fastapi import Depends, FastAPI
@@ -40,6 +41,42 @@ def course_client(tmp_path, monkeypatch):
 
 def _auth(user: str = "alice") -> dict[str, str]:
     return {"Authorization": f"Bearer {user}-token"}
+
+
+def _plant_runner_visible_course_storage(
+    data_root: Path,
+    *,
+    workspace_root: Path,
+    legacy_user_root: Path,
+    owner_scope: str,
+    seed_name: str,
+) -> dict:
+    """Plant a valid victim-owned Course aggregate where the runner can write."""
+    from deeptutor.course_mode.repository import CourseInput, CourseRepository
+    from deeptutor.services.path_service import PathService
+
+    seed_root = data_root / f"seed-{seed_name}"
+    seed_paths = PathService(
+        workspace_root=workspace_root,
+        course_storage_root=seed_root,
+        course_storage_anchor=data_root,
+    )
+    planted = (
+        CourseRepository(seed_paths, owner_scope=owner_scope)
+        .create_draft(
+            f"planted-{seed_name}",
+            CourseInput(title=f"Attacker planted {seed_name}"),
+        )
+        .course
+    )
+
+    legacy_user_root.mkdir(parents=True, exist_ok=True)
+    seed_paths.get_course_mode_db().rename(legacy_user_root / "course_mode.db")
+    legacy_workspace = legacy_user_root / "workspace" / "course-mode"
+    legacy_workspace.parent.mkdir(parents=True, exist_ok=True)
+    seed_paths.get_course_mode_workspace_root().rename(legacy_workspace)
+    seed_root.rmdir()
+    return planted.model_dump(mode="json")
 
 
 def test_create_list_and_reopen_draft(course_client: TestClient) -> None:
@@ -126,6 +163,82 @@ def test_actual_course_route_uses_server_private_storage_without_user_workspace_
         reopened = course_client.get(f"/api/v1/courses/{course['id']}", headers=_auth(actor))
         assert reopened.status_code == 200
         assert reopened.json() == {"course": course}
+
+
+def test_actual_course_route_ignores_runner_visible_course_storage(
+    course_client: TestClient,
+) -> None:
+    """Runner-writable legacy names never become authoritative Course storage."""
+    from deeptutor.multi_user import paths as multi_user_paths
+
+    data_root = course_client.app.state.test_data_root
+    actors = {
+        "admin": {
+            "owner_scope": "local-admin",
+            "workspace_root": data_root,
+            "legacy_user_root": data_root / "user",
+        },
+        "alice": {
+            "owner_scope": "u_alice",
+            "workspace_root": data_root / "users" / "u_alice",
+            "legacy_user_root": data_root / "users" / "u_alice" / "user",
+        },
+    }
+    planted: dict[str, dict] = {}
+    for actor, setup in actors.items():
+        planted[actor] = _plant_runner_visible_course_storage(
+            data_root,
+            workspace_root=setup["workspace_root"],
+            legacy_user_root=setup["legacy_user_root"],
+            owner_scope=setup["owner_scope"],
+            seed_name=actor,
+        )
+
+    created: dict[str, dict] = {}
+    for actor, setup in actors.items():
+        legacy_user_root = setup["legacy_user_root"]
+        legacy_database = legacy_user_root / "course_mode.db"
+        legacy_workspace = legacy_user_root / "workspace" / "course-mode"
+
+        empty = course_client.get("/api/v1/courses", headers=_auth(actor))
+        assert empty.status_code == 200
+        assert empty.json()["courses"] == []
+        assert (
+            course_client.get(
+                f"/api/v1/courses/{planted[actor]['id']}",
+                headers=_auth(actor),
+            ).status_code
+            == 404
+        )
+
+        response = course_client.post(
+            "/api/v1/courses",
+            headers={**_auth(actor), "Idempotency-Key": f"private-{actor}"},
+            json={"title": f"Private {actor} course"},
+        )
+        assert response.status_code == 201
+        created[actor] = response.json()["course"]
+        assert legacy_database.is_file()
+        assert (legacy_workspace / "courses" / planted[actor]["id"]).is_dir()
+
+    # A recreated service encounters both the private DB and conflicting legacy
+    # names. The untrusted entries must remain inert and cannot deny reopen.
+    multi_user_paths._path_services.clear()
+    for actor, setup in actors.items():
+        reopened = course_client.get(
+            f"/api/v1/courses/{created[actor]['id']}",
+            headers=_auth(actor),
+        )
+        assert reopened.status_code == 200
+        assert reopened.json() == {"course": created[actor]}
+        listed = course_client.get("/api/v1/courses", headers=_auth(actor))
+        assert [course["id"] for course in listed.json()["courses"]] == [created[actor]["id"]]
+        assert (setup["legacy_user_root"] / "course_mode.db").is_file()
+
+    private_databases = list(
+        (data_root / "system" / "course-mode" / "scopes").rglob("course_mode.db")
+    )
+    assert len(private_databases) == 2
 
 
 def test_create_requires_auth_and_a_stable_request_key(course_client: TestClient) -> None:

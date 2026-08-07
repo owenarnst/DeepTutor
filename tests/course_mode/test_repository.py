@@ -70,62 +70,21 @@ def test_create_persists_one_unit_workspace_and_audit_across_restart(
         ]
 
 
-def test_legacy_course_storage_moves_to_private_root_and_reopens_idempotently(
-    tmp_path: Path,
-) -> None:
-    data_root = tmp_path / "data"
-    seed_root = data_root / "seed-course-storage"
-    seed_paths = PathService(
-        workspace_root=data_root,
-        course_storage_root=seed_root,
-        course_storage_anchor=data_root,
-    )
-    course = (
-        CourseRepository(seed_paths, owner_scope="local-admin")
-        .create_draft("legacy-course", CourseInput(title="Migrated course"))
-        .course
-    )
-
-    legacy_user_root = data_root / "user"
-    legacy_user_root.mkdir()
-    seed_paths.get_course_mode_db().rename(legacy_user_root / "course_mode.db")
-    legacy_workspace = legacy_user_root / "workspace" / "course-mode"
-    legacy_workspace.parent.mkdir()
-    seed_paths.get_course_mode_workspace_root().rename(legacy_workspace)
-    seed_root.rmdir()
-
-    private_paths = PathService(workspace_root=data_root)
-    migrated = CourseRepository(private_paths, owner_scope="local-admin")
-    assert migrated.get(course.id) == course
-    assert not (legacy_user_root / "course_mode.db").exists()
-    assert not legacy_workspace.exists()
-    assert private_paths.get_course_mode_db().is_file()
-    assert private_paths.get_course_workspace(course.id).is_dir()
-
-    restarted = CourseRepository(PathService(workspace_root=data_root), owner_scope="local-admin")
-    assert restarted.get(course.id) == course
-
-
-def test_non_admin_legacy_course_storage_uses_real_scope_private_root(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from deeptutor.multi_user import paths as multi_user_paths
-    from deeptutor.multi_user.models import UserScope
-
+def test_repository_ignores_runner_visible_course_storage(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     user_root = data_root / "users" / "u_alice"
-    seed_root = data_root / "seed-alice-course-storage"
+    seed_root = data_root / "seed-attacker-storage"
     seed_paths = PathService(
         workspace_root=user_root,
         course_storage_root=seed_root,
         course_storage_anchor=data_root,
     )
-    course = (
+    planted = (
         CourseRepository(seed_paths, owner_scope="u_alice")
-        .create_draft("legacy-alice-course", CourseInput(title="Alice migrated course"))
+        .create_draft("planted-course", CourseInput(title="Attacker planted course"))
         .course
     )
+
     legacy_user_root = user_root / "user"
     legacy_user_root.mkdir(parents=True)
     seed_paths.get_course_mode_db().rename(legacy_user_root / "course_mode.db")
@@ -134,19 +93,26 @@ def test_non_admin_legacy_course_storage_uses_real_scope_private_root(
     seed_paths.get_course_mode_workspace_root().rename(legacy_workspace)
     seed_root.rmdir()
 
-    monkeypatch.setattr(multi_user_paths, "ADMIN_WORKSPACE_ROOT", data_root)
-    monkeypatch.setattr(multi_user_paths, "SYSTEM_ROOT", data_root / "system")
-    monkeypatch.setattr(multi_user_paths, "_path_services", {})
-    scope = UserScope(kind="user", user_id="u_alice", root=user_root)
-    scoped_paths = multi_user_paths.get_path_service_for_scope(scope)
-    assert CourseRepository(scoped_paths, owner_scope="u_alice").get(course.id) == course
-    assert scoped_paths.get_course_mode_db().is_relative_to(data_root / "system")
-    assert not (legacy_user_root / "course_mode.db").exists()
-    assert not legacy_workspace.exists()
+    private_paths = PathService(
+        workspace_root=user_root,
+        course_storage_root=data_root / "system" / "course-mode" / "scopes" / "alice",
+        course_storage_anchor=data_root,
+    )
+    repository = CourseRepository(private_paths, owner_scope="u_alice")
+    assert repository.list() == []
+    assert repository.get(planted.id) is None
 
-    multi_user_paths._path_services.clear()
-    restarted_paths = multi_user_paths.get_path_service_for_scope(scope)
-    assert CourseRepository(restarted_paths, owner_scope="u_alice").get(course.id) == course
+    private = repository.create_draft(
+        "private-course", CourseInput(title="Authoritative private course")
+    ).course
+    restarted = CourseRepository(private_paths, owner_scope="u_alice")
+    assert restarted.list() == [private]
+    assert restarted.get(planted.id) is None
+
+    assert (legacy_user_root / "course_mode.db").is_file()
+    assert (legacy_workspace / "courses" / planted.id).is_dir()
+    assert private_paths.get_course_mode_db().is_file()
+    assert private_paths.get_course_workspace(private.id).is_dir()
 
 
 def test_create_replays_normalized_input_and_rejects_changed_input(

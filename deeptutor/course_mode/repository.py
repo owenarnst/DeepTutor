@@ -16,8 +16,8 @@ from deeptutor.services.path_service import PathService
 
 from .artifacts import (
     InvalidArtifactPathError,
+    ensure_course_data_root,
     ensure_course_workspace,
-    migrate_legacy_course_storage,
     remove_empty_course_workspace,
 )
 from .models import Course, CourseStatus, Unit
@@ -174,7 +174,7 @@ class CourseRepository:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        migrate_legacy_course_storage(self.path_service)
+        ensure_course_data_root(self.path_service)
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
