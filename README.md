@@ -635,8 +635,12 @@ data/
 ├── user/                    # Admin workspace + global settings
 ├── users/<uid>/             # Per-user scope: chat history, memory, notebooks, KBs
 ├── partners/<id>/workspace/ # Partner (synthetic-user) scope
-└── system/                  # auth/users.json · grants/<uid>.json · audit/usage.jsonl
+└── system/                  # auth · grants · audit · private per-tenant Course data
 ```
+
+Course databases and Course artifact workspaces stay under `data/system/course-mode/`,
+outside the sandbox runner's workspace mounts. Docker deployments persist the whole
+`data/` tree as one backup unit.
 
 The **first registered user becomes admin** and owns model catalogs, provider credentials, shared knowledge bases, skills, and per-user grants. Everyone else gets an isolated workspace and a redacted Settings page — admin-assigned models, KBs, and skills show up as scoped, read-only options, never as raw API keys.
 

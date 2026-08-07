@@ -47,6 +47,8 @@ Mounts note:
   read/record the ``mounts`` field; what is visible is decided by the compose
   volume layout, and ``workdir`` is validated against the same roots
   (``DEEPTUTOR_RUNNER_ALLOWED_WORKDIRS``) as defence in depth.
+  Server-private Course databases and artifact workspaces live under
+  ``/app/data/system`` and are intentionally absent from this container.
 """
 
 from __future__ import annotations

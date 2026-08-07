@@ -125,6 +125,8 @@ services:
     # (data/system, data/user/settings) never enter this container; the
     # residual exposure is cross-user visibility *between user workspaces*,
     # acceptable for the invite-only trust posture and enforced no further.
+    # Course databases and Course artifact workspaces live under data/system,
+    # so neither is present in this untrusted container.
     volumes:
       - ./data/user/workspace:/app/data/user/workspace
       - ./data/users:/app/data/users
