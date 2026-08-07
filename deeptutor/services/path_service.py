@@ -6,6 +6,7 @@ Runtime data is constrained to:
 
 data/user/
 ├── chat_history.db
+├── course_mode.db
 ├── logs/
 ├── settings/
 └── workspace/
@@ -13,6 +14,7 @@ data/user/
     ├── notebook/
     ├── co-writer/
     ├── book/
+    ├── course-mode/
     └── chat/
         ├── chat/
         ├── deep_solve/
@@ -53,6 +55,7 @@ WorkspaceFeature = Literal[
     "co-writer",
     "chat",
     "book",
+    "course-mode",
 ]
 
 
@@ -226,7 +229,7 @@ class PathService:
             "_detached_code_execution",
         }:
             return self.get_chat_feature_dir(cast(ChatWorkspaceFeature, feature))
-        if feature in {"memory", "notebook", "co-writer", "book"}:
+        if feature in {"memory", "notebook", "co-writer", "book", "course-mode"}:
             return self.get_workspace_feature_dir(cast(WorkspaceFeature, feature))
         raise ValueError(f"Unknown workspace feature: {feature}")
 
@@ -360,6 +363,27 @@ class PathService:
         (root / "assets").mkdir(parents=True, exist_ok=True)
         return root
 
+    # ── Course Mode paths ────────────────────────────────
+
+    def get_course_mode_db(self) -> Path:
+        """Dedicated Course Mode database, separate from chat history."""
+        return self.get_user_root() / "course_mode.db"
+
+    def get_course_mode_workspace_root(self) -> Path:
+        return self.get_workspace_feature_dir("course-mode")
+
+    def get_course_workspace(self, course_id: str) -> Path:
+        """Resolve a server-generated UUID without permitting traversal."""
+        from uuid import UUID
+
+        try:
+            canonical = str(UUID(course_id))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("Invalid course id") from exc
+        if canonical != course_id:
+            raise ValueError("Invalid course id")
+        return self.get_course_mode_workspace_root() / "courses" / canonical
+
     def get_run_code_workspace_dir(self) -> Path:
         return self.get_chat_feature_dir("_detached_code_execution")
 
@@ -402,7 +426,9 @@ class PathService:
         self.ensure_memory_dir()
         self.ensure_notebook_dir()
         self.get_logs_dir().mkdir(parents=True, exist_ok=True)
-        for workspace_feature in cast(tuple[WorkspaceFeature, ...], ("co-writer", "book")):
+        for workspace_feature in cast(
+            tuple[WorkspaceFeature, ...], ("co-writer", "book", "course-mode")
+        ):
             self.get_workspace_feature_dir(workspace_feature).mkdir(parents=True, exist_ok=True)
         for chat_feature in cast(
             tuple[ChatWorkspaceFeature, ...],
