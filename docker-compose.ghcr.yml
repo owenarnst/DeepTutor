@@ -47,10 +47,9 @@ services:
       - "${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}:${DEEPTUTOR_DOCKER_FRONTEND_PORT:-3782}"
 
     volumes:
-      # Persistent data (created automatically on first start)
-      - ./data/user:/app/data/user
-      - ./data/memory:/app/data/memory
-      - ./data/knowledge_bases:/app/data/knowledge_bases
+      # One backupable persistence tree, including server-private Course data
+      # under data/system and per-user state under data/users.
+      - ./data:/app/data
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${DEEPTUTOR_DOCKER_BACKEND_PORT:-8001}/"]

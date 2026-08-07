@@ -48,6 +48,7 @@ export default function CoursesPage() {
   const [description, setDescription] = useState('')
   const [unitTitle, setUnitTitle] = useState('Unit 1')
   const pendingRequest = useRef<PendingRequest | null>(null)
+  const titleInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     let active = true
@@ -73,6 +74,11 @@ export default function CoursesPage() {
   }, [t])
 
   const draftCount = total
+
+  function openCreateForm() {
+    setShowCreate(true)
+    window.requestAnimationFrame(() => titleInputRef.current?.focus())
+  }
 
   async function handleLoadMore() {
     if (nextOffset === null || loadingMore) return
@@ -137,7 +143,10 @@ export default function CoursesPage() {
           </div>
           <button
             type="button"
-            onClick={() => setShowCreate(open => !open)}
+            onClick={() => {
+              if (showCreate) setShowCreate(false)
+              else openCreateForm()
+            }}
             aria-expanded={showCreate}
             aria-controls="new-course-form"
             className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--primary)] px-4 text-sm font-medium text-[var(--primary-foreground)] shadow-sm transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
@@ -170,6 +179,7 @@ export default function CoursesPage() {
             <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
               {t('Course title')}
               <input
+                ref={titleInputRef}
                 required
                 maxLength={200}
                 value={title}
@@ -233,7 +243,9 @@ export default function CoursesPage() {
         ) : courses.length === 0 ? (
           <button
             type="button"
-            onClick={() => setShowCreate(true)}
+            onClick={openCreateForm}
+            aria-expanded={showCreate}
+            aria-controls="new-course-form"
             className="flex w-full flex-col items-center rounded-2xl border border-dashed border-[var(--border)] px-6 py-16 text-center transition-colors hover:bg-[var(--secondary)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
           >
             <GraduationCap size={30} className="mb-3 text-[var(--primary)]" />

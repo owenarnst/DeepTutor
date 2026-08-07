@@ -22,7 +22,7 @@ from deeptutor.course_mode.repository import (
     InvalidRequestKeyError,
 )
 from deeptutor.multi_user.context import get_current_user
-from deeptutor.multi_user.paths import get_current_path_service
+from deeptutor.multi_user.paths import get_current_course_path_service
 from deeptutor.services.config.runtime_settings import load_system_settings
 
 router = APIRouter()
@@ -65,7 +65,7 @@ def get_course_repository() -> CourseRepository:
     user = get_current_user()
     max_courses = load_system_settings()["course_max_per_owner"]
     return CourseRepository(
-        get_current_path_service(),
+        get_current_course_path_service(),
         owner_scope=user.id,
         max_courses=max_courses,
     )

@@ -85,6 +85,11 @@ test.describe('Course Mode workflow', () => {
     await mockWorkspaceShellApi(page)
     await page.route('**/api/v1/courses**', async route => {
       const url = new URL(route.request().url())
+      const requestedCourse = allCourses.find(item => url.pathname.endsWith(`/${item.id}`))
+      if (requestedCourse) {
+        await route.fulfill({ json: { course: requestedCourse } })
+        return
+      }
       const offset = Number(url.searchParams.get('offset') || 0)
       offsets.push(String(offset))
       const courses = allCourses.slice(offset, offset + 50)
@@ -106,7 +111,12 @@ test.describe('Course Mode workflow', () => {
 
     await expect(page.getByRole('heading', { name: 'Course 54' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Load more' })).toHaveCount(0)
+    await expect(page.locator('a[href^="/courses/"]')).toHaveCount(55)
     expect(offsets).toEqual(['0', '50'])
+
+    await page.getByRole('heading', { name: 'Course 54' }).click()
+    await expect(page).toHaveURL(/\/courses\/course-54$/)
+    await expect(page.getByRole('heading', { level: 1, name: 'Course 54' })).toBeVisible()
     expect(unexpectedConsole).toEqual([])
   })
 
@@ -246,6 +256,45 @@ test.describe('Course Mode workflow', () => {
       await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
     ).toBe(true)
     await page.screenshot({ path: testInfo.outputPath('course-detail-mobile.png'), fullPage: true })
+    expect(unexpectedConsole).toEqual([])
+  })
+
+  test('empty gallery discloses the form and moves keyboard focus to its title', async ({
+    page,
+  }) => {
+    await mockCourseApi(page, [])
+    await page.goto('/courses')
+
+    const emptyCta = page.getByRole('button', { name: 'Create your first course' })
+    await expect(emptyCta).toHaveAttribute('aria-expanded', 'false')
+    await expect(emptyCta).toHaveAttribute('aria-controls', 'new-course-form')
+    await emptyCta.focus()
+    await page.keyboard.press('Enter')
+
+    await expect(emptyCta).toHaveAttribute('aria-expanded', 'true')
+    await expect(page.locator('#new-course-form')).toBeVisible()
+    await expect(page.getByLabel('Course title')).toBeFocused()
+  })
+
+  test('Book keeps its bottom content inside the mobile workspace viewport', async ({ page }) => {
+    const unexpectedConsole = observeUnexpectedConsole(page)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await mockWorkspaceShellApi(page)
+    await page.route('**/api/v1/book/books', route =>
+      route.fulfill({ json: { books: [] } })
+    )
+    await page.goto('/book')
+
+    await expect(page.getByText('No books yet')).toBeVisible()
+    const bookContent = page.locator('main').last()
+    const bounds = await bookContent.boundingBox()
+    expect(bounds).not.toBeNull()
+    expect((bounds?.y || 0) + (bounds?.height || 0)).toBeLessThanOrEqual(844)
+    await bookContent.evaluate(element => {
+      element.scrollTop = element.scrollHeight
+    })
+    await expect(bookContent.getByRole('button', { name: 'New book' })).toBeVisible()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390)
     expect(unexpectedConsole).toEqual([])
   })
 

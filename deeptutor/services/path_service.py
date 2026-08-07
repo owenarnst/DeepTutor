@@ -6,7 +6,6 @@ Runtime data is constrained to:
 
 data/user/
 ├── chat_history.db
-├── course_mode.db
 ├── logs/
 ├── settings/
 └── workspace/
@@ -14,7 +13,6 @@ data/user/
     ├── notebook/
     ├── co-writer/
     ├── book/
-    ├── course-mode/
     └── chat/
         ├── chat/
         ├── deep_solve/
@@ -64,7 +62,9 @@ class PathService:
 
     The default root is the historical ``data/`` directory.  The optional
     multi-user layer instantiates this class with ``data/users/<uid>/`` so the
-    public API can stay the same while disk writes become scoped per user.
+    public API can stay the same while ordinary workspace writes become scoped
+    per user. Course paths are separately rooted under server-private
+    ``data/system`` storage supplied by that layer.
     """
 
     _instance: "PathService | None" = None
@@ -80,7 +80,13 @@ class PathService:
     }
     _PRIVATE_SUFFIXES = {".json", ".sqlite", ".db", ".md", ".yaml", ".yml", ".py", ".log"}
 
-    def __init__(self, workspace_root: Path | None = None):
+    def __init__(
+        self,
+        workspace_root: Path | None = None,
+        *,
+        course_storage_root: Path | None = None,
+        course_storage_anchor: Path | None = None,
+    ) -> None:
         self._package_root = PACKAGE_ROOT
         self._uses_default_workspace_root = workspace_root is None
         self._workspace_root = (workspace_root or get_runtime_data_root()).resolve()
@@ -89,6 +95,23 @@ class PathService:
         # symlink/reparse point at the per-user boundary instead of silently
         # inheriting its resolved target.
         self._user_data_dir = self._workspace_root / "user"
+        # Course Mode is server-private: Docker's untrusted runner mounts user
+        # workspaces, but never this tree. Keep these paths lexical so the
+        # Course filesystem layer can reject links while traversing from the
+        # trusted anchor with directory handles.
+        self._course_storage_anchor = Path(course_storage_anchor or self._workspace_root)
+        self._course_storage_root = Path(
+            course_storage_root
+            or self._course_storage_anchor / "system" / "course-mode" / "scopes" / "local"
+        )
+        try:
+            relative_course_root = self._course_storage_root.relative_to(
+                self._course_storage_anchor
+            )
+        except ValueError as exc:
+            raise ValueError("Course storage root must be inside its trusted anchor") from exc
+        if not relative_course_root.parts:
+            raise ValueError("Course storage root must be below its trusted anchor")
 
     @classmethod
     def get_instance(cls) -> "PathService":
@@ -206,6 +229,8 @@ class PathService:
         return self.get_settings_dir() / name
 
     def get_workspace_feature_dir(self, feature: WorkspaceFeature) -> Path:
+        if feature == "course-mode":
+            return self.get_course_mode_workspace_root()
         return self.get_workspace_dir() / feature
 
     def get_chat_workspace_root(self) -> Path:
@@ -368,12 +393,20 @@ class PathService:
 
     # ── Course Mode paths ────────────────────────────────
 
+    def get_course_storage_anchor(self) -> Path:
+        """Trusted server-owned anchor used for handle-relative traversal."""
+        return self._course_storage_anchor
+
+    def get_course_storage_root(self) -> Path:
+        """Tenant-specific root that is never mounted into the sandbox runner."""
+        return self._course_storage_root
+
     def get_course_mode_db(self) -> Path:
         """Dedicated Course Mode database, separate from chat history."""
-        return self.get_user_root() / "course_mode.db"
+        return self.get_course_storage_root() / "course_mode.db"
 
     def get_course_mode_workspace_root(self) -> Path:
-        return self.get_workspace_feature_dir("course-mode")
+        return self.get_course_storage_root() / "workspace"
 
     def get_course_workspace(self, course_id: str) -> Path:
         """Resolve a server-generated UUID without permitting traversal."""
@@ -429,9 +462,7 @@ class PathService:
         self.ensure_memory_dir()
         self.ensure_notebook_dir()
         self.get_logs_dir().mkdir(parents=True, exist_ok=True)
-        for workspace_feature in cast(
-            tuple[WorkspaceFeature, ...], ("co-writer", "book", "course-mode")
-        ):
+        for workspace_feature in cast(tuple[WorkspaceFeature, ...], ("co-writer", "book")):
             self.get_workspace_feature_dir(workspace_feature).mkdir(parents=True, exist_ok=True)
         for chat_feature in cast(
             tuple[ChatWorkspaceFeature, ...],

@@ -70,6 +70,85 @@ def test_create_persists_one_unit_workspace_and_audit_across_restart(
         ]
 
 
+def test_legacy_course_storage_moves_to_private_root_and_reopens_idempotently(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    seed_root = data_root / "seed-course-storage"
+    seed_paths = PathService(
+        workspace_root=data_root,
+        course_storage_root=seed_root,
+        course_storage_anchor=data_root,
+    )
+    course = (
+        CourseRepository(seed_paths, owner_scope="local-admin")
+        .create_draft("legacy-course", CourseInput(title="Migrated course"))
+        .course
+    )
+
+    legacy_user_root = data_root / "user"
+    legacy_user_root.mkdir()
+    seed_paths.get_course_mode_db().rename(legacy_user_root / "course_mode.db")
+    legacy_workspace = legacy_user_root / "workspace" / "course-mode"
+    legacy_workspace.parent.mkdir()
+    seed_paths.get_course_mode_workspace_root().rename(legacy_workspace)
+    seed_root.rmdir()
+
+    private_paths = PathService(workspace_root=data_root)
+    migrated = CourseRepository(private_paths, owner_scope="local-admin")
+    assert migrated.get(course.id) == course
+    assert not (legacy_user_root / "course_mode.db").exists()
+    assert not legacy_workspace.exists()
+    assert private_paths.get_course_mode_db().is_file()
+    assert private_paths.get_course_workspace(course.id).is_dir()
+
+    restarted = CourseRepository(PathService(workspace_root=data_root), owner_scope="local-admin")
+    assert restarted.get(course.id) == course
+
+
+def test_non_admin_legacy_course_storage_uses_real_scope_private_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from deeptutor.multi_user import paths as multi_user_paths
+    from deeptutor.multi_user.models import UserScope
+
+    data_root = tmp_path / "data"
+    user_root = data_root / "users" / "u_alice"
+    seed_root = data_root / "seed-alice-course-storage"
+    seed_paths = PathService(
+        workspace_root=user_root,
+        course_storage_root=seed_root,
+        course_storage_anchor=data_root,
+    )
+    course = (
+        CourseRepository(seed_paths, owner_scope="u_alice")
+        .create_draft("legacy-alice-course", CourseInput(title="Alice migrated course"))
+        .course
+    )
+    legacy_user_root = user_root / "user"
+    legacy_user_root.mkdir(parents=True)
+    seed_paths.get_course_mode_db().rename(legacy_user_root / "course_mode.db")
+    legacy_workspace = legacy_user_root / "workspace" / "course-mode"
+    legacy_workspace.parent.mkdir()
+    seed_paths.get_course_mode_workspace_root().rename(legacy_workspace)
+    seed_root.rmdir()
+
+    monkeypatch.setattr(multi_user_paths, "ADMIN_WORKSPACE_ROOT", data_root)
+    monkeypatch.setattr(multi_user_paths, "SYSTEM_ROOT", data_root / "system")
+    monkeypatch.setattr(multi_user_paths, "_path_services", {})
+    scope = UserScope(kind="user", user_id="u_alice", root=user_root)
+    scoped_paths = multi_user_paths.get_path_service_for_scope(scope)
+    assert CourseRepository(scoped_paths, owner_scope="u_alice").get(course.id) == course
+    assert scoped_paths.get_course_mode_db().is_relative_to(data_root / "system")
+    assert not (legacy_user_root / "course_mode.db").exists()
+    assert not legacy_workspace.exists()
+
+    multi_user_paths._path_services.clear()
+    restarted_paths = multi_user_paths.get_path_service_for_scope(scope)
+    assert CourseRepository(restarted_paths, owner_scope="u_alice").get(course.id) == course
+
+
 def test_create_replays_normalized_input_and_rejects_changed_input(
     repository: CourseRepository,
 ) -> None:
@@ -247,8 +326,17 @@ def test_invalid_course_ids_never_reach_the_filesystem(
 
 
 def test_separate_path_services_are_isolated(tmp_path: Path) -> None:
-    alice_paths = PathService(workspace_root=tmp_path / "alice")
-    bob_paths = PathService(workspace_root=tmp_path / "bob")
+    private_root = tmp_path / "data" / "system" / "course-mode" / "scopes"
+    alice_paths = PathService(
+        workspace_root=tmp_path / "data" / "users" / "alice",
+        course_storage_root=private_root / "alice",
+        course_storage_anchor=tmp_path / "data",
+    )
+    bob_paths = PathService(
+        workspace_root=tmp_path / "data" / "users" / "bob",
+        course_storage_root=private_root / "bob",
+        course_storage_anchor=tmp_path / "data",
+    )
     alice = CourseRepository(alice_paths, owner_scope="alice")
     bob = CourseRepository(bob_paths, owner_scope="bob")
 
@@ -259,6 +347,16 @@ def test_separate_path_services_are_isolated(tmp_path: Path) -> None:
     assert alice.get(bob_course.id) is None
     assert [course.title for course in alice.list()] == ["Alice course"]
     assert [course.title for course in bob.list()] == ["Bob course"]
+    for scoped_paths, scoped_course in (
+        (alice_paths, created),
+        (bob_paths, bob_course),
+    ):
+        assert scoped_paths.get_course_mode_db().is_relative_to(tmp_path / "data" / "system")
+        assert scoped_paths.get_course_workspace(scoped_course.id).is_relative_to(
+            tmp_path / "data" / "system"
+        )
+        assert scoped_paths.get_course_workspace(scoped_course.id).is_dir()
+        assert not scoped_paths.get_course_mode_db().is_relative_to(tmp_path / "data" / "users")
 
 
 def test_course_quota_is_transactional_and_replay_succeeds_at_limit(

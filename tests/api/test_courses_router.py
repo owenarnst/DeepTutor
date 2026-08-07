@@ -16,12 +16,16 @@ def course_client(tmp_path, monkeypatch):
     from deeptutor.services.auth import TokenPayload
 
     tokens = {
+        "admin-token": TokenPayload(username="local", role="admin", user_id="local-admin"),
         "alice-token": TokenPayload(username="alice", role="user", user_id="u_alice"),
         "bob-token": TokenPayload(username="bob", role="user", user_id="u_bob"),
     }
     monkeypatch.setattr(auth_router, "AUTH_ENABLED", True)
     monkeypatch.setattr(auth_router, "decode_token", tokens.get)
-    monkeypatch.setattr(multi_user_paths, "USERS_ROOT", tmp_path / "data" / "users")
+    data_root = tmp_path / "data"
+    monkeypatch.setattr(multi_user_paths, "ADMIN_WORKSPACE_ROOT", data_root)
+    monkeypatch.setattr(multi_user_paths, "USERS_ROOT", data_root / "users")
+    monkeypatch.setattr(multi_user_paths, "SYSTEM_ROOT", data_root / "system")
     monkeypatch.setattr(multi_user_paths, "_path_services", {})
 
     app = FastAPI()
@@ -30,6 +34,7 @@ def course_client(tmp_path, monkeypatch):
         prefix="/api/v1/courses",
         dependencies=[Depends(auth_router.require_auth)],
     )
+    app.state.test_data_root = data_root
     return TestClient(app)
 
 
@@ -79,6 +84,48 @@ def test_create_list_and_reopen_draft(course_client: TestClient) -> None:
     reopened = course_client.get(f"/api/v1/courses/{course['id']}", headers=_auth())
     assert reopened.status_code == 200
     assert reopened.json() == {"course": course}
+
+
+def test_actual_course_route_uses_server_private_storage_without_user_workspace_prelude(
+    course_client: TestClient,
+) -> None:
+    from deeptutor.multi_user import paths as multi_user_paths
+
+    data_root = course_client.app.state.test_data_root
+    user_root = data_root / "users" / "u_alice"
+    assert not user_root.exists()
+
+    created: dict[str, dict] = {}
+    for actor in ("alice", "bob", "admin"):
+        response = course_client.post(
+            "/api/v1/courses",
+            headers={**_auth(actor), "Idempotency-Key": f"private-storage-{actor}"},
+            json={"title": f"{actor.title()} private course"},
+        )
+        assert response.status_code == 201
+        created[actor] = response.json()["course"]
+
+    assert not user_root.exists()
+    private_root = data_root / "system" / "course-mode" / "scopes"
+    databases = list(private_root.rglob("course_mode.db"))
+    assert len(databases) == 3
+    assert len({database.parent for database in databases}) == 3
+    for course in created.values():
+        workspaces = list(private_root.rglob(course["id"]))
+        assert len(workspaces) == 1
+        assert workspaces[0].is_relative_to(data_root / "system")
+        assert not workspaces[0].is_relative_to(data_root / "users")
+    for database in databases:
+        assert database.is_relative_to(data_root / "system")
+        assert not database.is_relative_to(data_root / "users")
+
+    # Recreate the real per-scope services, as a backend process restart would,
+    # then prove each authenticated route reopens only its own persisted Course.
+    multi_user_paths._path_services.clear()
+    for actor, course in created.items():
+        reopened = course_client.get(f"/api/v1/courses/{course['id']}", headers=_auth(actor))
+        assert reopened.status_code == 200
+        assert reopened.json() == {"course": course}
 
 
 def test_create_requires_auth_and_a_stable_request_key(course_client: TestClient) -> None:

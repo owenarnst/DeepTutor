@@ -73,6 +73,23 @@ def test_compose_files_do_not_consume_legacy_env_names() -> None:
         assert "DEEPTUTOR_DOCKER_BACKEND_PORT" in content
 
 
+def test_sandbox_runner_mounts_exclude_server_private_course_storage() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    application = content.split("  deeptutor:", 1)[1].split("  sandbox-runner:", 1)[0]
+    runner = content.split("  sandbox-runner:", 1)[1]
+    runner_volumes = runner.split("    volumes:", 1)[1].split("\n\n", 1)[0]
+
+    assert "./data:/app/data" in application
+    assert "./data/user/workspace:/app/data/user/workspace" in runner_volumes
+    assert "./data/users:/app/data/users" in runner_volumes
+    assert "data/system" not in runner_volumes
+    assert "/app/data:/app/data" not in runner_volumes
+
+    packaged = (root / "docker-compose.ghcr.yml").read_text(encoding="utf-8")
+    assert "./data:/app/data" in packaged
+
+
 def test_dockerfile_is_json_driven_without_bundle_sed() -> None:
     """The image no longer rewrites the built bundle at startup (the runtime
     ``sed -i`` broke under a read-only rootfs). URL/auth knowledge is JSON-driven:

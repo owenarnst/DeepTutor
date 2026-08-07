@@ -8,9 +8,11 @@ import pytest
 
 from deeptutor.course_mode.artifacts import (
     InvalidArtifactPathError,
+    UnsupportedCourseStorageError,
     ensure_course_workspace,
     normalize_artifact_relative_path,
     open_course_artifact_for_read,
+    remove_empty_course_workspace,
 )
 from deeptutor.course_mode.repository import CourseInput, CourseRepository
 from deeptutor.services.path_service import PathService
@@ -153,7 +155,7 @@ def test_v2_migration_rejects_cross_course_artifact_rows(
 
 @pytest.mark.parametrize(
     "boundary",
-    ["user", "workspace", "course-mode", "courses", "course"],
+    ["anchor", "system", "course-mode", "scopes", "scope", "workspace", "courses", "course"],
 )
 def test_course_workspace_creation_rejects_symlinked_storage_ancestors(
     paths: PathService,
@@ -161,10 +163,15 @@ def test_course_workspace_creation_rejects_symlinked_storage_ancestors(
     boundary: str,
 ) -> None:
     course_id = "11111111-1111-4111-8111-111111111111"
+    storage_root = paths.get_course_storage_root()
+    storage_anchor = paths.get_course_storage_anchor()
     targets = {
-        "user": paths.get_user_root(),
-        "workspace": paths.get_workspace_dir(),
-        "course-mode": paths.get_course_mode_workspace_root(),
+        "anchor": storage_anchor,
+        "system": storage_anchor / "system",
+        "course-mode": storage_anchor / "system" / "course-mode",
+        "scopes": storage_anchor / "system" / "course-mode" / "scopes",
+        "scope": storage_root,
+        "workspace": paths.get_course_mode_workspace_root(),
         "courses": paths.get_course_mode_workspace_root() / "courses",
         "course": paths.get_course_workspace(course_id),
     }
@@ -230,3 +237,48 @@ def test_artifact_open_is_safe_when_ancestor_is_replaced_during_operation(
     with open_course_artifact_for_read(paths, course_id, "notes/lesson.md") as artifact:
         assert artifact.read() == b"inside"
     assert swapped is True
+
+
+def test_workspace_creation_fails_closed_without_handle_relative_traversal(
+    paths: PathService,
+    monkeypatch,
+) -> None:
+    from deeptutor.course_mode import artifacts
+
+    monkeypatch.setattr(artifacts, "_SECURE_DIR_FD_SUPPORTED", False)
+
+    with pytest.raises(UnsupportedCourseStorageError, match="handle-relative"):
+        ensure_course_workspace(paths, "11111111-1111-4111-8111-111111111111")
+
+
+def test_artifact_read_fails_closed_without_handle_relative_traversal(
+    paths: PathService,
+    monkeypatch,
+) -> None:
+    from deeptutor.course_mode import artifacts
+
+    course_id = "11111111-1111-4111-8111-111111111111"
+    ensure_course_workspace(paths, course_id)
+    artifact_path = paths.get_course_workspace(course_id) / "lesson.md"
+    artifact_path.write_text("inside", encoding="utf-8")
+    monkeypatch.setattr(artifacts, "_SECURE_DIR_FD_SUPPORTED", False)
+
+    with pytest.raises(UnsupportedCourseStorageError, match="handle-relative"):
+        with open_course_artifact_for_read(paths, course_id, "lesson.md"):
+            pass
+
+
+def test_workspace_rollback_fails_closed_without_handle_relative_traversal(
+    paths: PathService,
+    monkeypatch,
+) -> None:
+    from deeptutor.course_mode import artifacts
+
+    course_id = "11111111-1111-4111-8111-111111111111"
+    ensure_course_workspace(paths, course_id)
+    workspace = paths.get_course_workspace(course_id)
+    monkeypatch.setattr(artifacts, "_SECURE_DIR_FD_SUPPORTED", False)
+
+    with pytest.raises(UnsupportedCourseStorageError, match="handle-relative"):
+        remove_empty_course_workspace(paths, course_id)
+    assert workspace.is_dir()

@@ -16,8 +16,8 @@ from deeptutor.services.path_service import PathService
 
 from .artifacts import (
     InvalidArtifactPathError,
-    ensure_course_data_root,
     ensure_course_workspace,
+    migrate_legacy_course_storage,
     remove_empty_course_workspace,
 )
 from .models import Course, CourseStatus, Unit
@@ -148,7 +148,13 @@ def _execute_migration_script(conn: sqlite3.Connection, script: str) -> None:
 
 
 class CourseRepository:
-    """One repository instance serves exactly one server-derived user scope."""
+    """One repository instance serves exactly one server-derived user scope.
+
+    SQLite accepts pathname databases rather than a pre-opened directory
+    handle. The path is safe because its ancestors are created no-follow under
+    the server-private Course root, which is absent from runner mounts and is
+    writable only by the trusted application process.
+    """
 
     def __init__(
         self,
@@ -168,7 +174,7 @@ class CourseRepository:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        ensure_course_data_root(self.path_service)
+        migrate_legacy_course_storage(self.path_service)
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
