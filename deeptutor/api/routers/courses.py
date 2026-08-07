@@ -56,6 +56,9 @@ class CreateCourseResponse(CourseResponse):
 
 class CourseListResponse(BaseModel):
     courses: list[Course]
+    total: int
+    has_more: bool
+    next_offset: int | None
 
 
 def get_course_repository() -> CourseRepository:
@@ -103,8 +106,13 @@ async def list_courses(
     offset: Annotated[int, Query(ge=0, le=MAX_COURSE_LIST_OFFSET)] = 0,
 ) -> CourseListResponse:
     repository = get_course_repository()
-    courses = await asyncio.to_thread(repository.list, limit=limit, offset=offset)
-    return CourseListResponse(courses=courses)
+    page = await asyncio.to_thread(repository.list_page, limit=limit, offset=offset)
+    return CourseListResponse(
+        courses=list(page.courses),
+        total=page.total,
+        has_more=page.has_more,
+        next_offset=page.next_offset,
+    )
 
 
 @router.get("/{course_id}", response_model=CourseResponse)

@@ -59,15 +59,25 @@ test('list and detail use retry-safe GETs and encode the course id', async () =>
   const restore = stubFetch((input, init) => {
     seen.push(String(input))
     assert.equal(init?.method, undefined)
-    if (String(input).endsWith('/courses')) {
-      return Response.json({ courses: [sampleCourse] })
+    if (String(input).includes('/courses?')) {
+      return Response.json({
+        courses: [sampleCourse],
+        total: 51,
+        has_more: false,
+        next_offset: null,
+      })
     }
     return Response.json({ course: sampleCourse })
   })
   try {
-    assert.equal((await coursesApi.list()).courses.length, 1)
+    const page = await coursesApi.list(50, 50)
+    assert.equal(page.courses.length, 1)
+    assert.equal(page.total, 51)
     assert.equal((await coursesApi.get('course/id')).course.title, 'Topology')
-    assert.deepEqual(seen, ['/api/v1/courses', '/api/v1/courses/course%2Fid'])
+    assert.deepEqual(seen, [
+      '/api/v1/courses?limit=50&offset=50',
+      '/api/v1/courses/course%2Fid',
+    ])
   } finally {
     restore()
   }

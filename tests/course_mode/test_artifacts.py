@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sqlite3
 
@@ -7,8 +8,9 @@ import pytest
 
 from deeptutor.course_mode.artifacts import (
     InvalidArtifactPathError,
+    ensure_course_workspace,
     normalize_artifact_relative_path,
-    resolve_course_artifact_path,
+    open_course_artifact_for_read,
 )
 from deeptutor.course_mode.repository import CourseInput, CourseRepository
 from deeptutor.services.path_service import PathService
@@ -114,7 +116,7 @@ def test_v2_artifact_schema_migrates_valid_rows_and_adds_composite_fk(
     repository.initialize()
 
     with sqlite3.connect(repository.db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         assert conn.execute(
             "SELECT relative_path FROM artifact_references WHERE id = 'artifact-a'"
         ).fetchone() == ("notes/a.md",)
@@ -149,17 +151,82 @@ def test_v2_migration_rejects_cross_course_artifact_rows(
         repository.initialize()
 
 
-def test_artifact_resolution_is_contained_and_rejects_symlink_components(
-    repository: CourseRepository, paths: PathService, tmp_path: Path
+@pytest.mark.parametrize(
+    "boundary",
+    ["user", "workspace", "course-mode", "courses", "course"],
+)
+def test_course_workspace_creation_rejects_symlinked_storage_ancestors(
+    paths: PathService,
+    tmp_path: Path,
+    boundary: str,
 ) -> None:
-    course = repository.create_draft("course-a", CourseInput(title="A")).course
-    resolved = resolve_course_artifact_path(paths, course.id, "notes/lesson.md")
-    assert resolved == paths.get_course_workspace(course.id) / "notes" / "lesson.md"
-
-    outside = tmp_path / "outside"
+    course_id = "11111111-1111-4111-8111-111111111111"
+    targets = {
+        "user": paths.get_user_root(),
+        "workspace": paths.get_workspace_dir(),
+        "course-mode": paths.get_course_mode_workspace_root(),
+        "courses": paths.get_course_mode_workspace_root() / "courses",
+        "course": paths.get_course_workspace(course_id),
+    }
+    target = targets[boundary]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / f"outside-{boundary}"
     outside.mkdir()
-    symlink = paths.get_course_workspace(course.id) / "linked"
-    symlink.symlink_to(outside, target_is_directory=True)
+    target.symlink_to(outside, target_is_directory=True)
 
-    with pytest.raises(InvalidArtifactPathError, match="symlink"):
-        resolve_course_artifact_path(paths, course.id, "linked/escape.md")
+    with pytest.raises(InvalidArtifactPathError, match="symlink|reparse"):
+        ensure_course_workspace(paths, course_id)
+
+
+def test_artifact_read_rejects_symlinked_descendant(
+    paths: PathService,
+    tmp_path: Path,
+) -> None:
+    course_id = "11111111-1111-4111-8111-111111111111"
+    ensure_course_workspace(paths, course_id)
+    outside = tmp_path / "outside-descendant"
+    outside.mkdir()
+    (outside / "lesson.md").write_text("outside", encoding="utf-8")
+    (paths.get_course_workspace(course_id) / "notes").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(InvalidArtifactPathError, match="symlink|reparse"):
+        with open_course_artifact_for_read(paths, course_id, "notes/lesson.md"):
+            pass
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"),
+    reason="directory-relative no-follow descriptors are unavailable",
+)
+def test_artifact_open_is_safe_when_ancestor_is_replaced_during_operation(
+    paths: PathService,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from deeptutor.course_mode import artifacts
+
+    course_id = "11111111-1111-4111-8111-111111111111"
+    ensure_course_workspace(paths, course_id)
+    notes = paths.get_course_workspace(course_id) / "notes"
+    notes.mkdir()
+    (notes / "lesson.md").write_text("inside", encoding="utf-8")
+    outside = tmp_path / "outside-race"
+    outside.mkdir()
+    (outside / "lesson.md").write_text("outside", encoding="utf-8")
+    detached = notes.with_name("notes-detached")
+    real_open = artifacts.os.open
+    swapped = False
+
+    def swap_before_leaf(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "lesson.md" and not swapped:
+            notes.rename(detached)
+            notes.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifacts.os, "open", swap_before_leaf)
+
+    with open_course_artifact_for_read(paths, course_id, "notes/lesson.md") as artifact:
+        assert artifact.read() == b"inside"
+    assert swapped is True

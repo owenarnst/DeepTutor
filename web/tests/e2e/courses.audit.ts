@@ -53,7 +53,14 @@ async function mockCourseApi(page: Page, listedCourses = [course]) {
       return
     }
     if (request.method() === 'GET') {
-      await route.fulfill({ json: { courses: listedCourses } })
+      await route.fulfill({
+        json: {
+          courses: listedCourses,
+          total: listedCourses.length,
+          has_more: false,
+          next_offset: null,
+        },
+      })
       return
     }
     await route.fallback()
@@ -61,6 +68,48 @@ async function mockCourseApi(page: Page, listedCourses = [course]) {
 }
 
 test.describe('Course Mode workflow', () => {
+  test('loads bounded pages until an older course is discoverable', async ({ page }) => {
+    const unexpectedConsole = observeUnexpectedConsole(page)
+    const allCourses = Array.from({ length: 55 }, (_, index) => ({
+      ...course,
+      id: `course-${index}`,
+      title: `Course ${index.toString().padStart(2, '0')}`,
+      workspace_ref: `courses/course-${index}`,
+      units: course.units.map(unit => ({
+        ...unit,
+        id: `unit-${index}`,
+        course_id: `course-${index}`,
+      })),
+    }))
+    const offsets: string[] = []
+    await mockWorkspaceShellApi(page)
+    await page.route('**/api/v1/courses**', async route => {
+      const url = new URL(route.request().url())
+      const offset = Number(url.searchParams.get('offset') || 0)
+      offsets.push(String(offset))
+      const courses = allCourses.slice(offset, offset + 50)
+      const nextOffset = offset + courses.length
+      await route.fulfill({
+        json: {
+          courses,
+          total: allCourses.length,
+          has_more: nextOffset < allCourses.length,
+          next_offset: nextOffset < allCourses.length ? nextOffset : null,
+        },
+      })
+    })
+
+    await page.goto('/courses')
+    await expect(page.getByText('Course 54')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Load more' })).toBeVisible()
+    await page.getByRole('button', { name: 'Load more' }).click()
+
+    await expect(page.getByRole('heading', { name: 'Course 54' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Load more' })).toHaveCount(0)
+    expect(offsets).toEqual(['0', '50'])
+    expect(unexpectedConsole).toEqual([])
+  })
+
   test('loads, creates, retries a lost response with one key, and reopens detail', async ({
     page,
   }) => {
@@ -92,7 +141,9 @@ test.describe('Course Mode workflow', () => {
         await route.fulfill({ json: { course } })
         return
       }
-      await route.fulfill({ json: { courses: [] } })
+      await route.fulfill({
+        json: { courses: [], total: 0, has_more: false, next_offset: null },
+      })
     })
 
     await page.goto('/courses')
@@ -133,7 +184,39 @@ test.describe('Course Mode workflow', () => {
     await page.goto('/courses')
 
     await expect(page.getByRole('heading', { level: 1, name: 'Your courses' })).toBeVisible()
-    await expect(page.locator('aside')).toBeHidden()
+    const navigationToggle = page.getByRole('button', { name: 'Expand sidebar' })
+    await expect(navigationToggle).toBeVisible()
+    await navigationToggle.click()
+    const navigation = page.getByRole('dialog', { name: 'Workspace navigation' })
+    await expect(navigation).toBeVisible()
+    await expect(navigation.getByRole('button', { name: 'Collapse sidebar' })).toBeFocused()
+    for (const href of [
+      '/home',
+      '/partners',
+      '/agents',
+      '/co-writer',
+      '/book',
+      '/courses',
+      '/space',
+      '/memory',
+      '/knowledge',
+      '/settings',
+    ]) {
+      await expect(navigation.locator(`a[href="${href}"]`)).toBeVisible()
+    }
+    await page.keyboard.press('Shift+Tab')
+    expect(
+      await page.evaluate(() =>
+        document.querySelector('[role="dialog"]')?.contains(document.activeElement)
+      )
+    ).toBe(true)
+    await page.keyboard.press('Escape')
+    await expect(navigation).toHaveCount(0)
+    await expect(navigationToggle).toBeFocused()
+
+    await navigationToggle.click()
+    await navigation.locator('a[href="/courses"]').click()
+    await expect(navigation).toHaveCount(0)
     const mainBox = await page.getByRole('main').boundingBox()
     expect(mainBox?.x).toBe(0)
     expect(mainBox?.width).toBe(390)

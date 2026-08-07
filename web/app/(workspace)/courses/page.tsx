@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { FormEvent, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ArrowRight,
@@ -16,6 +16,8 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import { coursesApi, type Course, type CreateCourseInput } from '@/lib/courses-api'
+
+const COURSE_PAGE_SIZE = 50
 
 interface PendingRequest {
   fingerprint: string
@@ -35,7 +37,10 @@ export default function CoursesPage() {
   const { t } = useTranslation()
   const router = useRouter()
   const [courses, setCourses] = useState<Course[]>([])
+  const [total, setTotal] = useState(0)
+  const [nextOffset, setNextOffset] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [creating, setCreating] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
   const [error, setError] = useState('')
@@ -47,9 +52,13 @@ export default function CoursesPage() {
   useEffect(() => {
     let active = true
     coursesApi
-      .list()
+      .list(COURSE_PAGE_SIZE, 0)
       .then(result => {
-        if (active) setCourses(result.courses)
+        if (active) {
+          setCourses(result.courses)
+          setTotal(result.total)
+          setNextOffset(result.next_offset)
+        }
       })
       .catch((reason: unknown) => {
         if (active)
@@ -63,10 +72,26 @@ export default function CoursesPage() {
     }
   }, [t])
 
-  const draftCount = useMemo(
-    () => courses.filter(course => course.status === 'draft').length,
-    [courses]
-  )
+  const draftCount = total
+
+  async function handleLoadMore() {
+    if (nextOffset === null || loadingMore) return
+    setLoadingMore(true)
+    setError('')
+    try {
+      const result = await coursesApi.list(COURSE_PAGE_SIZE, nextOffset)
+      setCourses(current => {
+        const known = new Set(current.map(course => course.id))
+        return [...current, ...result.courses.filter(course => !known.has(course.id))]
+      })
+      setTotal(result.total)
+      setNextOffset(result.next_offset)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : t('Could not load courses.'))
+    } finally {
+      setLoadingMore(false)
+    }
+  }
 
   async function handleCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -123,7 +148,7 @@ export default function CoursesPage() {
         </header>
 
         <section aria-label={t('Course Mode')} className="mb-7 grid gap-3 sm:grid-cols-3">
-          <Metric icon={<BookOpen size={16} />} label={t('Courses')} value={courses.length} />
+          <Metric icon={<BookOpen size={16} />} label={t('Courses')} value={total} />
           <Metric icon={<Sparkles size={16} />} label={t('Drafts')} value={draftCount} />
           <Metric icon={<Target size={16} />} label={t('Mastery tracking')} value="—" />
         </section>
@@ -220,38 +245,53 @@ export default function CoursesPage() {
             </span>
           </button>
         ) : (
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {courses.map(course => (
-              <Link
-                key={course.id}
-                href={`/courses/${encodeURIComponent(course.id)}`}
-                className="group min-w-0 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:border-[var(--primary)]/40 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
-              >
-                <div className="mb-6 flex items-start justify-between gap-4">
-                  <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
-                    {t('Draft')}
-                  </span>
-                  <ArrowRight
-                    size={16}
-                    className="text-[var(--muted-foreground)] transition-transform group-hover:translate-x-1"
-                  />
-                </div>
-                <h2 className="font-semibold text-[var(--foreground)]">{course.title}</h2>
-                <p className="mt-2 line-clamp-2 min-h-10 text-sm leading-5 text-[var(--muted-foreground)]">
-                  {course.description || t('No description yet.')}
-                </p>
-                <div className="mt-5 flex items-center justify-between border-t border-[var(--border)] pt-4 text-xs text-[var(--muted-foreground)]">
-                  <span className="flex min-w-0 items-center gap-1.5 truncate">
-                    <BookOpen size={13} />
-                    {course.units[0]?.title}
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <CalendarClock size={13} />
-                    {t('Not scheduled')}
-                  </span>
-                </div>
-              </Link>
-            ))}
+          <div>
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {courses.map(course => (
+                <Link
+                  key={course.id}
+                  href={`/courses/${encodeURIComponent(course.id)}`}
+                  className="group min-w-0 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-sm transition-all hover:-translate-y-0.5 hover:border-[var(--primary)]/40 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"
+                >
+                  <div className="mb-6 flex items-start justify-between gap-4">
+                    <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
+                      {t('Draft')}
+                    </span>
+                    <ArrowRight
+                      size={16}
+                      className="text-[var(--muted-foreground)] transition-transform group-hover:translate-x-1"
+                    />
+                  </div>
+                  <h2 className="font-semibold text-[var(--foreground)]">{course.title}</h2>
+                  <p className="mt-2 line-clamp-2 min-h-10 text-sm leading-5 text-[var(--muted-foreground)]">
+                    {course.description || t('No description yet.')}
+                  </p>
+                  <div className="mt-5 flex items-center justify-between border-t border-[var(--border)] pt-4 text-xs text-[var(--muted-foreground)]">
+                    <span className="flex min-w-0 items-center gap-1.5 truncate">
+                      <BookOpen size={13} />
+                      {course.units[0]?.title}
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <CalendarClock size={13} />
+                      {t('Not scheduled')}
+                    </span>
+                  </div>
+                </Link>
+              ))}
+            </div>
+            {nextOffset !== null && (
+              <div className="mt-6 flex justify-center">
+                <button
+                  type="button"
+                  onClick={handleLoadMore}
+                  disabled={loadingMore}
+                  className="inline-flex h-10 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--card)] px-4 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--secondary)]/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2 disabled:opacity-50"
+                >
+                  {loadingMore && <Loader2 size={14} className="animate-spin" />}
+                  {t('Load more')}
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

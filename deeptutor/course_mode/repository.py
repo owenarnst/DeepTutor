@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
 import re
 import sqlite3
 from typing import Iterator
@@ -15,9 +14,15 @@ from uuid import UUID, uuid4
 
 from deeptutor.services.path_service import PathService
 
+from .artifacts import (
+    InvalidArtifactPathError,
+    ensure_course_data_root,
+    ensure_course_workspace,
+    remove_empty_course_workspace,
+)
 from .models import Course, CourseStatus, Unit
 
-_LATEST_SCHEMA_VERSION = 3
+_LATEST_SCHEMA_VERSION = 4
 _REQUEST_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 DEFAULT_MAX_COURSES_PER_OWNER = 200
 DEFAULT_COURSE_LIST_LIMIT = 50
@@ -66,6 +71,24 @@ class CreateCourseResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class CoursePage:
+    courses: tuple[Course, ...]
+    total: int
+    limit: int
+    offset: int
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + len(self.courses) < self.total
+
+    @property
+    def next_offset(self) -> int | None:
+        if not self.has_more:
+            return None
+        return self.offset + len(self.courses)
+
+
 def _normalize_text(value: str) -> str:
     return " ".join(value.split())
 
@@ -111,6 +134,19 @@ def _validate_course_id(course_id: str) -> str:
     return canonical
 
 
+def _execute_migration_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute static DDL statements without ``executescript``'s implicit commit."""
+    buffer: list[str] = []
+    for line in script.splitlines():
+        buffer.append(line)
+        statement = "\n".join(buffer)
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            buffer.clear()
+    if "".join(buffer).strip():
+        raise RuntimeError("Incomplete Course Mode migration statement")
+
+
 class CourseRepository:
     """One repository instance serves exactly one server-derived user scope."""
 
@@ -132,7 +168,7 @@ class CourseRepository:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_course_data_root(self.path_service)
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -152,6 +188,11 @@ class CourseRepository:
                     f"Course Mode database schema {version} is newer than supported"
                 )
 
+            # Schema v4 replaces mutually-referencing tables. SQLite cannot
+            # toggle foreign-key enforcement inside a transaction, so disable
+            # it before taking the migration lease and prove the rebuilt graph
+            # with ``foreign_key_check`` before commit.
+            conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("BEGIN IMMEDIATE")
             try:
                 # Another process may have completed migration while this
@@ -172,10 +213,21 @@ class CourseRepository:
                 if version < 3:
                     self._migrate_to_v3(conn)
                     conn.execute("PRAGMA user_version = 3")
+                    version = 3
+                if version < 4:
+                    self._migrate_to_v4(conn)
+                    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise sqlite3.IntegrityError(
+                            "Course Mode migration produced invalid foreign keys"
+                        )
+                    conn.execute("PRAGMA user_version = 4")
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
+            finally:
+                conn.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _migrate_to_v1(conn: sqlite3.Connection) -> None:
@@ -324,6 +376,147 @@ class CourseRepository:
         )
         conn.execute("DROP TABLE artifact_references_v2")
 
+    @staticmethod
+    def _migrate_to_v4(conn: sqlite3.Connection) -> None:
+        invalid = conn.execute(
+            """
+            SELECT c.id
+            FROM courses AS c
+            LEFT JOIN units AS u ON u.course_id = c.id
+            GROUP BY c.id
+            HAVING COUNT(u.id) != 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise sqlite3.IntegrityError(
+                "Every Course must have exactly one Unit before schema migration"
+            )
+
+        _execute_migration_script(
+            conn,
+            """
+            CREATE TABLE courses_v4 (
+                id TEXT PRIMARY KEY,
+                owner_scope TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                status TEXT NOT NULL,
+                workspace_ref TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                primary_unit_id TEXT NOT NULL,
+                UNIQUE(id, primary_unit_id),
+                FOREIGN KEY(id, primary_unit_id)
+                    REFERENCES units_v4(course_id, id) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE units_v4 (
+                id TEXT PRIMARY KEY,
+                course_id TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                position INTEGER NOT NULL CHECK(position = 0),
+                UNIQUE(course_id, position),
+                UNIQUE(course_id, id),
+                FOREIGN KEY(course_id) REFERENCES courses_v4(id) ON DELETE RESTRICT
+                    DEFERRABLE INITIALLY DEFERRED
+            );
+
+            CREATE TABLE idempotency_keys_v4 (
+                owner_scope TEXT NOT NULL,
+                request_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                course_id TEXT NOT NULL REFERENCES courses_v4(id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (owner_scope, request_key)
+            );
+
+            CREATE TABLE course_audit_events_v4 (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                course_id TEXT NOT NULL REFERENCES courses_v4(id) ON DELETE RESTRICT,
+                event_type TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL
+            );
+
+            CREATE TABLE artifact_references_v4 (
+                id TEXT PRIMARY KEY,
+                course_id TEXT NOT NULL REFERENCES courses_v4(id) ON DELETE RESTRICT,
+                unit_id TEXT,
+                kind TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(course_id, relative_path),
+                FOREIGN KEY(course_id, unit_id)
+                    REFERENCES units_v4(course_id, id) ON DELETE RESTRICT,
+                CHECK(length(relative_path) > 0),
+                CHECK(instr(relative_path, char(0)) = 0),
+                CHECK(instr(relative_path, '\\') = 0),
+                CHECK(substr(relative_path, 1, 1) != '/'),
+                CHECK(NOT (
+                    substr(relative_path, 1, 1) GLOB '[A-Za-z]'
+                    AND substr(relative_path, 2, 1) = ':'
+                )),
+                CHECK(relative_path NOT IN ('.', '..')),
+                CHECK(instr('/' || relative_path || '/', '/./') = 0),
+                CHECK(instr('/' || relative_path || '/', '/../') = 0),
+                CHECK(instr(relative_path, '//') = 0),
+                CHECK(substr(relative_path, -1, 1) != '/')
+            );
+
+            INSERT INTO courses_v4(
+                id, owner_scope, title, description, status, workspace_ref,
+                created_at, updated_at, primary_unit_id
+            )
+            SELECT
+                c.id, c.owner_scope, c.title, c.description, c.status, c.workspace_ref,
+                c.created_at, c.updated_at, u.id
+            FROM courses AS c
+            JOIN units AS u ON u.course_id = c.id;
+
+            INSERT INTO units_v4(id, course_id, title, position)
+            SELECT id, course_id, title, position FROM units;
+
+            INSERT INTO idempotency_keys_v4
+            SELECT * FROM idempotency_keys;
+
+            INSERT INTO course_audit_events_v4
+            SELECT * FROM course_audit_events;
+
+            INSERT INTO artifact_references_v4
+            SELECT * FROM artifact_references;
+
+            DROP TRIGGER IF EXISTS course_audit_events_no_update;
+            DROP TRIGGER IF EXISTS course_audit_events_no_delete;
+            DROP TABLE artifact_references;
+            DROP TABLE course_audit_events;
+            DROP TABLE idempotency_keys;
+            DROP TABLE units;
+            DROP TABLE courses;
+
+            ALTER TABLE courses_v4 RENAME TO courses;
+            ALTER TABLE units_v4 RENAME TO units;
+            ALTER TABLE idempotency_keys_v4 RENAME TO idempotency_keys;
+            ALTER TABLE course_audit_events_v4 RENAME TO course_audit_events;
+            ALTER TABLE artifact_references_v4 RENAME TO artifact_references;
+
+            CREATE INDEX idx_courses_owner_updated
+            ON courses(owner_scope, updated_at DESC);
+            CREATE UNIQUE INDEX idx_units_course_id_id ON units(course_id, id);
+
+            CREATE TRIGGER course_audit_events_no_update
+            BEFORE UPDATE ON course_audit_events
+            BEGIN SELECT RAISE(ABORT, 'course audit events are append-only'); END;
+
+            CREATE TRIGGER course_audit_events_no_delete
+            BEFORE DELETE ON course_audit_events
+            BEGIN SELECT RAISE(ABORT, 'course audit events are append-only'); END;
+            """,
+        )
+
     def create_draft(self, request_key: str, course_input: CourseInput) -> CreateCourseResult:
         if not _REQUEST_KEY_RE.fullmatch(request_key):
             raise InvalidRequestKeyError("Idempotency key must be 1-128 URL-safe characters")
@@ -331,7 +524,6 @@ class CourseRepository:
         request_fingerprint = _fingerprint(normalized)
         self.initialize()
 
-        workspace: Path | None = None
         workspace_created = False
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -371,11 +563,15 @@ class CourseRepository:
                 now = datetime.now(timezone.utc).isoformat()
                 workspace_ref = f"courses/{course_id}"
                 conn.execute(
+                    "INSERT INTO units(id, course_id, title, position) VALUES (?, ?, ?, 0)",
+                    (unit_id, course_id, normalized.unit_title),
+                )
+                conn.execute(
                     """
                     INSERT INTO courses(
                         id, owner_scope, title, description, status, workspace_ref,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        created_at, updated_at, primary_unit_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         course_id,
@@ -386,11 +582,8 @@ class CourseRepository:
                         workspace_ref,
                         now,
                         now,
+                        unit_id,
                     ),
-                )
-                conn.execute(
-                    "INSERT INTO units(id, course_id, title, position) VALUES (?, ?, ?, 0)",
-                    (unit_id, course_id, normalized.unit_title),
                 )
                 conn.execute(
                     """
@@ -401,9 +594,7 @@ class CourseRepository:
                     (self.owner_scope, request_key, request_fingerprint, course_id, now),
                 )
 
-                workspace = self.path_service.get_course_workspace(course_id)
-                workspace_created = not workspace.exists()
-                workspace.mkdir(parents=True, exist_ok=True)
+                workspace_created = ensure_course_workspace(self.path_service, course_id)
 
                 conn.execute(
                     """
@@ -429,10 +620,10 @@ class CourseRepository:
                 return CreateCourseResult(course=course, created=True)
             except Exception:
                 conn.rollback()
-                if workspace_created and workspace is not None:
+                if workspace_created:
                     try:
-                        workspace.rmdir()
-                    except OSError:
+                        remove_empty_course_workspace(self.path_service, course_id)
+                    except (OSError, InvalidArtifactPathError):
                         pass
                 raise
 
@@ -442,12 +633,27 @@ class CourseRepository:
         limit: int = DEFAULT_COURSE_LIST_LIMIT,
         offset: int = 0,
     ) -> list[Course]:
+        return list(self.list_page(limit=limit, offset=offset).courses)
+
+    def list_page(
+        self,
+        *,
+        limit: int = DEFAULT_COURSE_LIST_LIMIT,
+        offset: int = 0,
+    ) -> CoursePage:
         if not 1 <= limit <= MAX_COURSE_LIST_LIMIT:
             raise ValueError(f"limit must be between 1 and {MAX_COURSE_LIST_LIMIT}")
         if not 0 <= offset <= MAX_COURSE_LIST_OFFSET:
             raise ValueError(f"offset must be between 0 and {MAX_COURSE_LIST_OFFSET}")
         self.initialize()
         with self._connect() as conn:
+            conn.execute("BEGIN")
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM courses WHERE owner_scope = ?",
+                    (self.owner_scope,),
+                ).fetchone()[0]
+            )
             rows = conn.execute(
                 """
                 SELECT
@@ -462,7 +668,14 @@ class CourseRepository:
                 """,
                 (self.owner_scope, limit, offset),
             ).fetchall()
-            return [self._course_from_list_row(row) for row in rows]
+            courses = tuple(self._course_from_list_row(row) for row in rows)
+            conn.commit()
+            return CoursePage(
+                courses=courses,
+                total=total,
+                limit=limit,
+                offset=offset,
+            )
 
     @staticmethod
     def _course_from_list_row(row: sqlite3.Row) -> Course:
@@ -522,6 +735,7 @@ __all__ = [
     "MAX_COURSE_LIST_LIMIT",
     "MAX_COURSE_LIST_OFFSET",
     "CourseInput",
+    "CoursePage",
     "CourseQuotaExceededError",
     "CourseRepository",
     "CreateCourseResult",

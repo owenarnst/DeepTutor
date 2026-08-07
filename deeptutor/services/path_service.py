@@ -85,7 +85,10 @@ class PathService:
         self._uses_default_workspace_root = workspace_root is None
         self._workspace_root = (workspace_root or get_runtime_data_root()).resolve()
         self._project_root = self._workspace_root.parent.resolve()
-        self._user_data_dir = (self._workspace_root / "user").resolve()
+        # Keep this lexical so security-sensitive consumers can detect a
+        # symlink/reparse point at the per-user boundary instead of silently
+        # inheriting its resolved target.
+        self._user_data_dir = self._workspace_root / "user"
 
     @classmethod
     def get_instance(cls) -> "PathService":

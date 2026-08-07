@@ -69,7 +69,12 @@ def test_create_list_and_reopen_draft(course_client: TestClient) -> None:
 
     listed = course_client.get("/api/v1/courses", headers=_auth())
     assert listed.status_code == 200
-    assert listed.json() == {"courses": [course]}
+    assert listed.json() == {
+        "courses": [course],
+        "total": 1,
+        "has_more": False,
+        "next_offset": None,
+    }
 
     reopened = course_client.get(f"/api/v1/courses/{course['id']}", headers=_auth())
     assert reopened.status_code == 200
@@ -134,7 +139,12 @@ def test_missing_foreign_and_traversal_ids_do_not_leak(course_client: TestClient
     traversal = course_client.get("/api/v1/courses/%2E%2E%5Cforeign", headers=_auth("alice"))
     assert traversal.status_code in {400, 404}
 
-    assert course_client.get("/api/v1/courses", headers=_auth("bob")).json() == {"courses": []}
+    assert course_client.get("/api/v1/courses", headers=_auth("bob")).json() == {
+        "courses": [],
+        "total": 0,
+        "has_more": False,
+        "next_offset": None,
+    }
 
 
 def test_course_list_is_paginated_and_bounded(course_client: TestClient) -> None:
@@ -152,6 +162,9 @@ def test_course_list_is_paginated_and_bounded(course_client: TestClient) -> None
     )
     assert page.status_code == 200
     assert len(page.json()["courses"]) == 1
+    assert page.json()["total"] == 3
+    assert page.json()["has_more"] is True
+    assert page.json()["next_offset"] == 2
     assert course_client.get("/api/v1/courses?limit=101", headers=_auth()).status_code == 422
     assert course_client.get("/api/v1/courses?offset=10001", headers=_auth()).status_code == 422
 
@@ -194,24 +207,29 @@ def test_quota_rejects_new_course_but_allows_replay_at_limit(
 @pytest.mark.asyncio
 async def test_list_moves_blocking_repository_work_off_event_loop(monkeypatch) -> None:
     from deeptutor.api.routers import courses as courses_router
+    from deeptutor.course_mode.repository import CoursePage
+
+    order: list[str] = []
 
     class SlowRepository:
-        def list(self, *, limit: int, offset: int):
+        def list_page(self, *, limit: int, offset: int):
             assert (limit, offset) == (50, 0)
             time.sleep(0.05)
-            return []
+            order.append("repository-finished")
+            return CoursePage(courses=(), total=0, limit=limit, offset=offset)
 
     monkeypatch.setattr(courses_router, "get_course_repository", SlowRepository)
-    heartbeat_ran = False
 
     async def heartbeat() -> None:
-        nonlocal heartbeat_ran
         await asyncio.sleep(0.005)
-        heartbeat_ran = True
+        order.append("heartbeat")
 
+    list_task = asyncio.create_task(courses_router.list_courses(limit=50, offset=0))
     heartbeat_task = asyncio.create_task(heartbeat())
-    response = await courses_router.list_courses(limit=50, offset=0)
     await heartbeat_task
+    assert order == ["heartbeat"]
+
+    response = await list_task
 
     assert response.courses == []
-    assert heartbeat_ran is True
+    assert order == ["heartbeat", "repository-finished"]

@@ -18,7 +18,6 @@ const sidebar = readFileSync(
 
 test('Course Mode has a discoverable gallery and dedicated detail route', () => {
   assert.match(sidebar, /href:\s*"\/courses"/)
-  assert.match(gallery, /coursesApi\s*\.list\(\)/)
   assert.match(gallery, /coursesApi\s*\.create\(input, requestKey\)/)
   assert.match(gallery, /t\('Draft'\)/)
   assert.match(detail, /coursesApi\s*\.get\(params\.courseId\)/)

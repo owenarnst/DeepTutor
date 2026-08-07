@@ -120,6 +120,7 @@ const DOCS_URL = "https://deeptutor.info/";
 const RECENTS_COLLAPSED_KEY = "deeptutor.sidebar.recentsCollapsed";
 
 interface SidebarShellProps {
+  forceExpanded?: boolean;
   sessions?: SessionSummary[];
   activeSessionId?: string | null;
   loadingSessions?: boolean;
@@ -138,6 +139,7 @@ interface SidebarShellProps {
 }
 
 export function SidebarShell({
+  forceExpanded = false,
   sessions = [],
   activeSessionId = null,
   loadingSessions = false,
@@ -152,8 +154,8 @@ export function SidebarShell({
   const router = useRouter();
   const { t } = useTranslation();
   const { has } = useCapabilityAccess();
-  const { sidebarCollapsed: collapsed, setSidebarCollapsed: setCollapsed } =
-    useAppShell();
+  const { sidebarCollapsed, setSidebarCollapsed: setCollapsed } = useAppShell();
+  const collapsed = forceExpanded ? false : sidebarCollapsed;
 
   const navLocked = (item: NavEntry) =>
     item.requires ? !has(item.requires) : false;
@@ -348,13 +350,15 @@ export function SidebarShell({
             className="h-[22px] w-auto transition-transform duration-200 group-hover:scale-105"
           />
         </Link>
-        <button
-          onClick={() => setCollapsed(true)}
-          className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
-          aria-label={t("Collapse sidebar")}
-        >
-          <PanelLeftClose size={15} />
-        </button>
+        {!forceExpanded && (
+          <button
+            onClick={() => setCollapsed(true)}
+            className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)]"
+            aria-label={t("Collapse sidebar")}
+          >
+            <PanelLeftClose size={15} />
+          </button>
+        )}
       </div>
 
       {/* Primary nav */}

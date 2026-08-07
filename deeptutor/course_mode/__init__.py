@@ -2,20 +2,25 @@
 
 from .artifacts import (
     InvalidArtifactPathError,
+    ensure_course_data_root,
+    ensure_course_workspace,
     normalize_artifact_relative_path,
-    resolve_course_artifact_path,
+    open_course_artifact_for_read,
 )
 from .models import ArtifactReference, Course, CourseStatus, Unit
-from .repository import CourseInput, CourseRepository
+from .repository import CourseInput, CoursePage, CourseRepository
 
 __all__ = [
     "ArtifactReference",
     "Course",
     "CourseInput",
+    "CoursePage",
     "CourseRepository",
     "CourseStatus",
     "InvalidArtifactPathError",
     "Unit",
+    "ensure_course_data_root",
+    "ensure_course_workspace",
     "normalize_artifact_relative_path",
-    "resolve_course_artifact_path",
+    "open_course_artifact_for_read",
 ]

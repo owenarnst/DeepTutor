@@ -151,7 +151,7 @@ def test_initializes_an_existing_empty_database(paths: PathService) -> None:
     CourseRepository(paths, owner_scope="user-a").initialize()
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         tables = {
             row[0]
             for row in conn.execute(
@@ -220,7 +220,7 @@ def test_migrates_an_older_schema_without_losing_courses(paths: PathService) -> 
     assert existing.title == "Existing"
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
         columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_references)")}
         assert "relative_path" in columns
         assert "body" not in columns
@@ -276,6 +276,69 @@ def test_course_quota_is_transactional_and_replay_succeeds_at_limit(
     assert replay.course.id == first.course.id
 
 
+def test_database_cannot_commit_a_course_without_its_one_unit(
+    repository: CourseRepository,
+) -> None:
+    created = repository.create_draft("one-unit", CourseInput(title="One unit")).course
+
+    with sqlite3.connect(repository.db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM units WHERE course_id = ?", (created.id,))
+
+    malformed_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    missing_unit_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    with pytest.raises(sqlite3.IntegrityError):
+        with sqlite3.connect(repository.db_path) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute(
+                """
+                INSERT INTO courses(
+                    id, owner_scope, title, description, status, workspace_ref,
+                    created_at, updated_at, primary_unit_id
+                ) VALUES (?, 'user-a', 'Malformed', '', 'draft', ?, 'now', 'now', ?)
+                """,
+                (malformed_id, f"courses/{malformed_id}", missing_unit_id),
+            )
+
+    with sqlite3.connect(repository.db_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM courses WHERE id = ?", (malformed_id,)).fetchone()[0]
+            == 0
+        )
+
+
+def test_v3_migration_backfills_primary_unit_and_rejects_zero_unit_corruption(
+    repository: CourseRepository,
+) -> None:
+    valid = repository.create_draft("valid", CourseInput(title="Valid")).course
+    with sqlite3.connect(repository.db_path) as conn:
+        conn.execute("PRAGMA user_version = 3")
+
+    repository.initialize()
+    with sqlite3.connect(repository.db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute(
+            "SELECT primary_unit_id FROM courses WHERE id = ?", (valid.id,)
+        ).fetchone() == (valid.units[0].id,)
+
+    broken = repository.create_draft("broken", CourseInput(title="Broken")).course
+    with sqlite3.connect(repository.db_path) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DELETE FROM units WHERE course_id = ?", (broken.id,))
+        conn.execute("PRAGMA user_version = 3")
+
+    with pytest.raises(sqlite3.IntegrityError, match="exactly one Unit"):
+        repository.initialize()
+
+    with sqlite3.connect(repository.db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert (
+            conn.execute("SELECT COUNT(*) FROM courses WHERE id = ?", (broken.id,)).fetchone()[0]
+            == 1
+        )
+
+
 def test_list_is_bounded_and_validates_pagination(repository: CourseRepository) -> None:
     for index in range(5):
         repository.create_draft(f"course-{index}", CourseInput(title=f"Course {index}"))
@@ -287,6 +350,29 @@ def test_list_is_bounded_and_validates_pagination(repository: CourseRepository) 
         repository.list(limit=MAX_COURSE_LIST_LIMIT + 1)
     with pytest.raises(ValueError):
         repository.list(offset=-1)
+
+
+def test_list_page_exposes_total_and_reaches_courses_beyond_first_batch(
+    repository: CourseRepository,
+) -> None:
+    for index in range(55):
+        repository.create_draft(
+            f"many-{index}",
+            CourseInput(title=f"Course {index:02d}"),
+        )
+
+    first = repository.list_page(limit=50, offset=0)
+    final = repository.list_page(limit=50, offset=50)
+
+    assert len(first.courses) == 50
+    assert first.total == 55
+    assert first.has_more is True
+    assert first.next_offset == 50
+    assert len(final.courses) == 5
+    assert final.total == 55
+    assert final.has_more is False
+    assert final.next_offset is None
+    assert {course.id for course in first.courses}.isdisjoint(course.id for course in final.courses)
 
 
 def test_current_schema_reads_do_not_open_write_transactions_or_run_n_plus_one_queries(
@@ -313,4 +399,6 @@ def test_current_schema_reads_do_not_open_write_transactions_or_run_n_plus_one_q
         for statement in normalized
         if statement.startswith("SELECT") and " FROM COURSES" in statement
     ]
-    assert len(data_selects) == 1
+    assert len(data_selects) == 2
+    assert sum("COUNT(*)" in statement for statement in data_selects) == 1
+    assert sum("LEFT JOIN UNITS" in statement for statement in data_selects) == 1

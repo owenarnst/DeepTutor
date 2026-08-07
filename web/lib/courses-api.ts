@@ -26,6 +26,13 @@ export interface CreateCourseInput {
   unit_title?: string
 }
 
+export interface CourseListPage {
+  courses: Course[]
+  total: number
+  has_more: boolean
+  next_offset: number | null
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await apiFetch(apiUrl(`${BASE}${path}`), init)
   if (!response.ok) {
@@ -51,6 +58,10 @@ export const coursesApi = {
       },
       body: JSON.stringify(input),
     }),
-  list: () => request<{ courses: Course[] }>(''),
+  list: (limit = 50, offset = 0) =>
+    request<CourseListPage>(`?${new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    }).toString()}`),
   get: (courseId: string) => request<{ course: Course }>(`/${encodeURIComponent(courseId)}`),
 }
