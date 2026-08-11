@@ -4,6 +4,9 @@ import pytest
 
 from deeptutor.course_mode.models import ManifestRole, ManifestVisibility
 from deeptutor.course_mode.source_processing import (
+    COURSE_MAX_FILE_BYTES,
+    COURSE_MAX_PDF_BYTES,
+    COURSE_MAX_TOTAL_BYTES,
     COURSE_MAX_UPLOAD_COUNT,
     InvalidCourseSourceError,
     infer_manifest_role,
@@ -111,6 +114,13 @@ def test_upload_request_has_a_file_count_budget() -> None:
 
     with pytest.raises(InvalidCourseSourceError, match="file count"):
         validate_upload_batch(uploads)
+
+
+def test_course_upload_budgets_fit_document_and_proxy_policy() -> None:
+    assert COURSE_MAX_FILE_BYTES == 100 * 1024 * 1024
+    assert COURSE_MAX_PDF_BYTES == 50 * 1024 * 1024
+    assert COURSE_MAX_TOTAL_BYTES == 200 * 1024 * 1024
+    assert COURSE_MAX_TOTAL_BYTES < 210 * 1024 * 1024
 
 
 def test_normal_docx_is_extractable_after_ooxml_safety_check() -> None:

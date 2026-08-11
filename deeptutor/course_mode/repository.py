@@ -38,9 +38,12 @@ from .models import (
     Unit,
 )
 from .source_processing import (
+    CourseUpload,
     DefaultCourseIngestionAdapter,
     InvalidCourseSourceError,
     infer_manifest_role,
+    prepare_course_upload_stream,
+    validate_course_upload_streams,
     validate_upload_batch,
     validate_upload_batch_identity,
 )
@@ -936,25 +939,42 @@ class CourseRepository:
         self,
         request_key: str,
         course_input: CourseInput,
-        uploads: Iterable[tuple[str, bytes]],
+        uploads: Iterable[tuple[str, bytes] | CourseUpload],
     ) -> CourseImportResult:
         """Create one strict Course aggregate and durably queue its sources.
 
-        Every upload is parsed before the transaction mutates Course storage.
-        The transaction then owns the database rows and compensates all files
-        if any row, audit, or filesystem operation fails.
+        Byte uploads retain the in-memory repository contract used by local
+        callers. HTTP uploads arrive as rewindable CourseUpload streams: the
+        identity pass hashes them in bounded chunks, then extraction and
+        staging consume one source at a time inside the compensating
+        transaction so an accepted batch is never retained as one aggregate
+        byte object.
         """
         if not _REQUEST_KEY_RE.fullmatch(request_key):
             raise InvalidRequestKeyError("Idempotency key must be 1-128 URL-safe characters")
         normalized = _normalize_input(course_input, require_source=True)
         uploads = tuple(uploads)
-        cheap_identities = validate_upload_batch_identity(uploads)
-        upload_identities = tuple(
-            sorted(
-                f"{display_name}\x00{content_hash}\x00{size}"
-                for _original_name, display_name, content_hash, _content, size in cheap_identities
-            )
+        stream_uploads = tuple(upload for upload in uploads if isinstance(upload, CourseUpload))
+        if stream_uploads and len(stream_uploads) != len(uploads):
+            raise InvalidCourseSourceError("Uploaded sources use incompatible handoff types")
+        stream_identities = (
+            validate_course_upload_streams(stream_uploads) if stream_uploads else None
         )
+        if stream_identities is not None:
+            upload_identities = tuple(
+                sorted(
+                    f"{display_name}\x00{content_hash}\x00{size}"
+                    for _upload, _original_name, display_name, content_hash, size in stream_identities
+                )
+            )
+        else:
+            cheap_identities = validate_upload_batch_identity(uploads)
+            upload_identities = tuple(
+                sorted(
+                    f"{display_name}\x00{content_hash}\x00{size}"
+                    for _original_name, display_name, content_hash, _content, size in cheap_identities
+                )
+            )
         request_fingerprint = _import_fingerprint(normalized, upload_identities)
         self.initialize()
 
@@ -994,10 +1014,7 @@ class CourseRepository:
                 )
             conn.commit()
 
-        try:
-            prepared = validate_upload_batch(uploads)
-        except InvalidCourseSourceError:
-            raise
+        prepared = None if stream_identities is not None else validate_upload_batch(uploads)
 
         workspace_created = False
         written_paths: list[str] = []
@@ -1083,7 +1100,19 @@ class CourseRepository:
                 # Store only sanitized POSIX-relative names. All writes go via
                 # operation-owned no-follow descriptors; the API never exposes
                 # these paths to a caller.
-                for original_name, display_name, content_hash, content, text, size in prepared:
+                prepared_uploads = (
+                    (prepare_course_upload_stream(identity) for identity in stream_identities)
+                    if stream_identities is not None
+                    else iter(prepared or ())
+                )
+                for (
+                    original_name,
+                    display_name,
+                    content_hash,
+                    content,
+                    text,
+                    size,
+                ) in prepared_uploads:
                     relative_path = f"sources/{display_name}"
                     write_course_artifact_atomic(
                         self.path_service,
@@ -1126,6 +1155,7 @@ class CourseRepository:
                         """,
                         (str(uuid4()), course_id, unit_id, relative_path, content_hash, now),
                     )
+                    del content, text
 
                 conn.execute(
                     """
@@ -1164,7 +1194,7 @@ class CourseRepository:
                             {
                                 "course_id": course_id,
                                 "job_id": job_id,
-                                "source_count": len(prepared),
+                                "source_count": len(stream_identities or prepared or ()),
                             },
                             separators=(",", ":"),
                             sort_keys=True,

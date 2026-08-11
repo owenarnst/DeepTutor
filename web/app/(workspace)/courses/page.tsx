@@ -290,7 +290,7 @@ export default function CoursesPage() {
                 aria-describedby="source-files-help"
               />
               <span id="source-files-help" className="text-[11px] font-normal text-[var(--muted-foreground)]">
-                {t('Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected.')}
+                {t('Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected. Upload limit: 100 MB per file (PDF 50 MB), 200 MB total.')}
               </span>
               {fileNames.length > 0 && (
                 <span role="status" className="text-[11px] font-normal text-[var(--foreground)]">
@@ -321,7 +321,7 @@ export default function CoursesPage() {
                 disabled={creating}
                 className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2 disabled:opacity-50"
               >
-                {creating && <Loader2 size={14} className="animate-spin" />}
+                {creating && <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />}
                 {t('Import course')}
               </button>
             </div>
@@ -340,7 +340,7 @@ export default function CoursesPage() {
 
         {loading ? (
           <div role="status" aria-live="polite" className="flex items-center justify-center gap-2 py-20 text-sm text-[var(--muted-foreground)]">
-            <Loader2 size={16} className="animate-spin" /> {t('Loading courses…')}
+            <Loader2 size={16} className="animate-spin motion-reduce:animate-none" /> {t('Loading courses…')}
           </div>
         ) : courses.length === 0 ? (
           <button
@@ -401,7 +401,7 @@ export default function CoursesPage() {
                   disabled={loadingMore}
                   className="inline-flex h-10 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--card)] px-4 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--secondary)]/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2 disabled:opacity-50"
                 >
-                  {loadingMore && <Loader2 size={14} className="animate-spin" />}
+                  {loadingMore && <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />}
                   {t('Load more')}
                 </button>
               </div>

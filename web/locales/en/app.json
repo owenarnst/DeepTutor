@@ -3018,6 +3018,7 @@
   "Weekly minutes": "Weekly minutes",
   "Source files": "Source files",
   "Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected.": "Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected.",
+  "Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected. Upload limit: 100 MB per file (PDF 50 MB), 200 MB total.": "Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected. Upload limit: 100 MB per file (PDF 50 MB), 200 MB total.",
   "Scheduling (optional)": "Scheduling (optional)",
   "Saved for learner context only; DeepTutor never fetches this URL.": "Saved for learner context only; DeepTutor never fetches this URL.",
   "Schedule": "Schedule",

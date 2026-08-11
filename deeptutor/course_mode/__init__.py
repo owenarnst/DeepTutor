@@ -37,10 +37,12 @@ from .repository import (
 )
 from .source_processing import (
     COURSE_MAX_FILE_BYTES,
+    COURSE_MAX_PDF_BYTES,
     COURSE_MAX_TOTAL_BYTES,
     COURSE_MAX_UPLOAD_COUNT,
     COURSE_SUPPORTED_EXTENSIONS,
     CourseIngestionAdapter,
+    CourseUpload,
     DefaultCourseIngestionAdapter,
     InvalidCourseSourceError,
 )
@@ -72,9 +74,11 @@ __all__ = [
     "UnsupportedCourseStorageError",
     "Unit",
     "COURSE_MAX_FILE_BYTES",
+    "COURSE_MAX_PDF_BYTES",
     "COURSE_MAX_TOTAL_BYTES",
     "COURSE_MAX_UPLOAD_COUNT",
     "COURSE_SUPPORTED_EXTENSIONS",
+    "CourseUpload",
     "DefaultCourseIngestionAdapter",
     "ensure_course_data_root",
     "ensure_course_private_directory",

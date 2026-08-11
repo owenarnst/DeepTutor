@@ -86,6 +86,14 @@ export interface ManifestEntry {
   updated_at: string
 }
 
+export interface ManifestEntryUpdate {
+  id: string
+  role?: ManifestRole
+  visibility?: ManifestVisibility
+  role_confirmed?: boolean
+  visibility_confirmed?: boolean
+}
+
 export interface CourseManifest {
   course_id: string
   revision: number
@@ -156,13 +164,21 @@ export const coursesApi = {
   updateManifest: (
     courseId: string,
     revision: number,
-    entries: Array<Partial<ManifestEntry> & Pick<ManifestEntry, 'id'>>
-  ) =>
-    request<CourseManifest>(`/${encodeURIComponent(courseId)}/manifest`, {
+    entries: ManifestEntryUpdate[]
+  ) => {
+    const updates: ManifestEntryUpdate[] = entries.map(entry => ({
+      id: entry.id,
+      role: entry.role,
+      visibility: entry.visibility,
+      role_confirmed: entry.role_confirmed,
+      visibility_confirmed: entry.visibility_confirmed,
+    }))
+    return request<CourseManifest>(`/${encodeURIComponent(courseId)}/manifest`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ revision, entries }),
-    }),
+      body: JSON.stringify({ revision, entries: updates }),
+    })
+  },
   approveManifest: (courseId: string, revision: number) =>
     request<CourseManifest>(`/${encodeURIComponent(courseId)}/manifest/approve`, {
       method: 'POST',

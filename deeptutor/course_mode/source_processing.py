@@ -17,14 +17,13 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-from typing import Any, Awaitable, Callable, Iterable, Protocol
+from typing import Any, Awaitable, BinaryIO, Callable, Iterable, Protocol
 import unicodedata
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 from deeptutor.services.rag.file_routing import FileTypeRouter
 from deeptutor.utils.document_extractor import extract_text_from_bytes
-from deeptutor.utils.document_validator import DocumentValidator
 
 from .models import ManifestRole, ManifestVisibility
 
@@ -42,13 +41,42 @@ class RoleProposal:
     visibility_confirmed: bool
 
 
+@dataclass
+class CourseUpload:
+    """A seekable, Course-owned upload handoff kept outside aggregate RAM."""
+
+    filename: str
+    stream: BinaryIO
+    declared_size: int | None = None
+
+    def rewind(self) -> None:
+        try:
+            if not self.stream.seekable():
+                raise InvalidCourseSourceError("Uploaded source stream is not rewindable")
+            self.stream.seek(0)
+        except (OSError, ValueError, AttributeError) as exc:
+            raise InvalidCourseSourceError("Uploaded source stream is not rewindable") from exc
+
+    def close(self) -> None:
+        try:
+            self.stream.close()
+        except (OSError, ValueError):
+            pass
+
+
 COURSE_SUPPORTED_EXTENSIONS = frozenset(
     FileTypeRouter.PARSER_EXTENSIONS | FileTypeRouter.TEXT_EXTENSIONS
 )
 COURSE_REJECTED_IMAGE_EXTENSIONS = frozenset(FileTypeRouter.IMAGE_EXTENSIONS | {".svg"})
-COURSE_MAX_FILE_BYTES = DocumentValidator.MAX_FILE_SIZE
-COURSE_MAX_TOTAL_BYTES = COURSE_MAX_FILE_BYTES * 5
+# Course imports travel through the 210 MiB Next proxy cap. Keep aggregate
+# source bytes below it with multipart overhead headroom, and align the
+# general/document policy with the repository's documented 100 MiB cap. PDFs
+# use the stricter 50 MiB policy used by the document processing path.
+COURSE_MAX_FILE_BYTES = 100 * 1024 * 1024
+COURSE_MAX_PDF_BYTES = 50 * 1024 * 1024
+COURSE_MAX_TOTAL_BYTES = 200 * 1024 * 1024
 COURSE_MAX_UPLOAD_COUNT = 32
+_COURSE_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 _WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _BAD_FILENAME_CHARS = re.compile(r"[\x00-\x1f\x7f<>:\"/\\|?*]")
 _KNOWN_BINARY_MAGICS = (
@@ -61,6 +89,45 @@ _KNOWN_BINARY_MAGICS = (
     b"RIFF",
     b"\x00\x00\x01\x00",
 )
+
+
+def course_file_limit(filename: str, *, max_file_bytes: int | None = None) -> int:
+    """Return the Course byte budget for one sanitized-or-raw filename."""
+    general_limit = COURSE_MAX_FILE_BYTES if max_file_bytes is None else max_file_bytes
+    if PurePosixPath(filename.strip()).suffix.lower() == ".pdf":
+        return min(general_limit, COURSE_MAX_PDF_BYTES)
+    return general_limit
+
+
+def _read_course_upload(
+    upload: CourseUpload,
+    *,
+    max_bytes: int,
+    collect: bool,
+) -> tuple[bytes | None, str, int]:
+    """Hash or collect one rewindable upload in bounded chunks."""
+    upload.rewind()
+    digest = hashlib.sha256()
+    content = bytearray() if collect else None
+    size = 0
+    try:
+        while True:
+            chunk = upload.stream.read(_COURSE_UPLOAD_READ_CHUNK_BYTES)
+            if not isinstance(chunk, bytes):
+                raise InvalidCourseSourceError("Uploaded source stream is invalid")
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                raise InvalidCourseSourceError("Uploaded source exceeds the upload size limit")
+            digest.update(chunk)
+            if content is not None:
+                content.extend(chunk)
+    except (OSError, ValueError) as exc:
+        raise InvalidCourseSourceError("Uploaded source stream is invalid") from exc
+    finally:
+        upload.rewind()
+    return (bytes(content) if content is not None else None), digest.hexdigest(), size
 
 
 def _looks_like_binary_text(content: bytes) -> bool:
@@ -167,9 +234,10 @@ def prepare_upload_identity(
     if not isinstance(content, bytes):
         raise InvalidCourseSourceError("Uploaded content is invalid")
     display_name = sanitize_upload_filename(filename)
+    file_limit = course_file_limit(display_name, max_file_bytes=max_file_bytes)
     if not content:
         raise InvalidCourseSourceError(f"{display_name} is empty")
-    if len(content) > max_file_bytes:
+    if len(content) > file_limit:
         raise InvalidCourseSourceError(f"{display_name} exceeds the upload size limit")
     extension = PurePosixPath(display_name).suffix.lower()
     if extension in FileTypeRouter.TEXT_EXTENSIONS:
@@ -186,7 +254,7 @@ def prepare_upload_identity(
         text = extract_text_from_bytes(
             display_name,
             content,
-            max_bytes=max_file_bytes,
+            max_bytes=file_limit,
             max_chars=500_000,
         )
     except Exception as exc:
@@ -225,7 +293,8 @@ def validate_upload_batch_identity(
         if not content:
             raise InvalidCourseSourceError(f"{display_name} is empty")
         size = len(content)
-        if size > max_file_bytes:
+        file_limit = course_file_limit(display_name, max_file_bytes=max_file_bytes)
+        if size > file_limit:
             raise InvalidCourseSourceError(f"{display_name} exceeds the upload size limit")
         content_hash = hashlib.sha256(content).hexdigest()
         name_key = display_name.casefold()
@@ -243,6 +312,74 @@ def validate_upload_batch_identity(
     if not identities:
         raise InvalidCourseSourceError("At least one supported text-extractable source is required")
     return tuple(identities)
+
+
+def validate_course_upload_streams(
+    uploads: Iterable[CourseUpload],
+    *,
+    max_file_bytes: int = COURSE_MAX_FILE_BYTES,
+    max_total_bytes: int = COURSE_MAX_TOTAL_BYTES,
+) -> tuple[tuple[CourseUpload, str, str, str, int], ...]:
+    """Hash and validate spooled uploads without retaining their bytes."""
+    identities: list[tuple[CourseUpload, str, str, str, int]] = []
+    seen_names: set[str] = set()
+    seen_identities: set[tuple[str, str]] = set()
+    total = 0
+    for index, upload in enumerate(uploads):
+        if index >= COURSE_MAX_UPLOAD_COUNT:
+            raise InvalidCourseSourceError("Course source file count exceeds the request limit")
+        if not isinstance(upload, CourseUpload):
+            raise InvalidCourseSourceError("Uploaded source stream is invalid")
+        display_name = sanitize_upload_filename(upload.filename)
+        file_limit = course_file_limit(display_name, max_file_bytes=max_file_bytes)
+        content, content_hash, size = _read_course_upload(
+            upload,
+            max_bytes=file_limit,
+            collect=False,
+        )
+        del content
+        if size == 0:
+            raise InvalidCourseSourceError(f"{display_name} is empty")
+        name_key = display_name.casefold()
+        identity = (display_name, content_hash)
+        if name_key in seen_names:
+            raise InvalidCourseSourceError(f"Duplicate filename after sanitization: {display_name}")
+        if identity in seen_identities:
+            raise InvalidCourseSourceError("Duplicate uploaded source identity")
+        seen_names.add(name_key)
+        seen_identities.add(identity)
+        total += size
+        if total > max_total_bytes:
+            raise InvalidCourseSourceError("Uploaded Course sources exceed the batch size limit")
+        identities.append((upload, upload.filename, display_name, content_hash, size))
+    if not identities:
+        raise InvalidCourseSourceError("At least one supported text-extractable source is required")
+    return tuple(identities)
+
+
+def prepare_course_upload_stream(
+    identity: tuple[CourseUpload, str, str, str, int],
+    *,
+    max_file_bytes: int = COURSE_MAX_FILE_BYTES,
+) -> tuple[str, str, str, bytes, str, int]:
+    """Extract one spooled upload, verifying it did not change after hashing."""
+    upload, original_name, display_name, expected_hash, expected_size = identity
+    file_limit = course_file_limit(display_name, max_file_bytes=max_file_bytes)
+    content, content_hash, size = _read_course_upload(
+        upload,
+        max_bytes=file_limit,
+        collect=True,
+    )
+    if content is None or size != expected_size or content_hash != expected_hash:
+        raise InvalidCourseSourceError("Uploaded source changed during processing")
+    prepared_display, prepared_hash, text, prepared_size = prepare_upload_identity(
+        original_name,
+        content,
+        max_file_bytes=file_limit,
+    )
+    if prepared_display != display_name or prepared_hash != expected_hash:
+        raise InvalidCourseSourceError("Uploaded source changed during processing")
+    return original_name, prepared_display, prepared_hash, content, text, prepared_size
 
 
 def validate_upload_batch(

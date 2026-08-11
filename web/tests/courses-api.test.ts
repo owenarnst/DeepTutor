@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { coursesApi, type CreateCourseInput } from '../lib/courses-api'
+import { coursesApi, type CreateCourseInput, type ManifestEntry } from '../lib/courses-api'
 
 const sampleCourse = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -88,6 +88,50 @@ test('list and detail use retry-safe GETs and encode the course id', async () =>
       '/api/v1/courses?limit=50&offset=50',
       '/api/v1/courses/course%2Fid',
     ])
+  } finally {
+    restore()
+  }
+})
+
+test('manifest updates serialize only the five backend-approved fields', async () => {
+  const entry: ManifestEntry = {
+    id: '44444444-4444-4444-8444-444444444444',
+    course_id: sampleCourse.id,
+    source_id: '55555555-5555-4555-8555-555555555555',
+    original_filename: 'lecture-notes.txt',
+    display_filename: 'lecture-notes.txt',
+    role: 'lecture_note',
+    visibility: 'learner_visible',
+    suspected_solution: false,
+    role_confirmed: true,
+    visibility_confirmed: true,
+    created_at: '2026-08-06T00:00:00+00:00',
+    updated_at: '2026-08-06T00:00:00+00:00',
+  }
+  const restore = stubFetch((input, init) => {
+    assert.equal(String(input), `/api/v1/courses/${sampleCourse.id}/manifest`)
+    const body = JSON.parse(String(init?.body)) as { revision: number; entries: object[] }
+    assert.equal(body.revision, 7)
+    assert.deepEqual(body.entries, [
+      {
+        id: entry.id,
+        role: entry.role,
+        visibility: entry.visibility,
+        role_confirmed: entry.role_confirmed,
+        visibility_confirmed: entry.visibility_confirmed,
+      },
+    ])
+    assert.deepEqual(Object.keys(body.entries[0]).sort(), [
+      'id',
+      'role',
+      'role_confirmed',
+      'visibility',
+      'visibility_confirmed',
+    ])
+    return Response.json({})
+  })
+  try {
+    await coursesApi.updateManifest(sampleCourse.id, 7, [entry])
   } finally {
     restore()
   }

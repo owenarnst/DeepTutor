@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import io
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from deeptutor.course_mode.repository import (
     ManifestApprovalBlockedError,
     ManifestRevisionConflictError,
 )
-from deeptutor.course_mode.source_processing import DefaultCourseIngestionAdapter
+from deeptutor.course_mode.source_processing import CourseUpload, DefaultCourseIngestionAdapter
 from deeptutor.services.path_service import PathService
 
 
@@ -113,6 +114,33 @@ def test_queued_job_can_be_resumed_after_process_restart(
     assert resumed.status is CourseJobStatus.AWAITING_MANIFEST_REVIEW
     assert adapter.calls == 1
     assert len(reopened.get_manifest(created.course.id).entries) == 1
+
+
+def test_stream_upload_handoff_reads_each_source_in_bounded_chunks(
+    repository: CourseRepository,
+) -> None:
+    class BoundedReader(io.BytesIO):
+        def __init__(self, content: bytes) -> None:
+            super().__init__(content)
+            self.max_read_size = 0
+            self.unbounded_reads = 0
+
+        def read(self, size: int = -1) -> bytes:
+            if size < 0:
+                self.unbounded_reads += 1
+            self.max_read_size = max(self.max_read_size, size)
+            return super().read(size)
+
+    reader = BoundedReader(b"Vectors are independent directions.")
+    created = repository.create_import(
+        "import-stream-handoff",
+        _input(),
+        [CourseUpload(filename="lecture.md", stream=reader)],
+    )
+
+    assert created.processing_job.status is CourseJobStatus.QUEUED
+    assert reader.unbounded_reads == 0
+    assert reader.max_read_size <= 1024 * 1024
 
 
 def test_concurrent_queued_retries_share_one_recovery_claim(

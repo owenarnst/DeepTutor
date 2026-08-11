@@ -571,6 +571,38 @@ def test_import_exposes_durable_processing_and_manifest_review(course_client: Te
     assert approved.json()["course_id"] == payload["course"]["id"]
 
 
+def test_manifest_endpoint_rejects_immutable_entry_fields(
+    course_client: TestClient,
+) -> None:
+    created = _create_course(course_client, key="manifest-schema", title="Manifest schema")
+    assert created.status_code == 201
+    payload = created.json()
+    manifest = course_client.get(
+        f"/api/v1/courses/{payload['course']['id']}/manifest", headers=_auth()
+    ).json()
+    entry = manifest["entries"][0]
+
+    response = course_client.patch(
+        f"/api/v1/courses/{payload['course']['id']}/manifest",
+        headers=_auth(),
+        json={
+            "revision": manifest["revision"],
+            "entries": [
+                {
+                    "id": entry["id"],
+                    "course_id": entry["course_id"],
+                    "role": entry["role"],
+                    "visibility": entry["visibility"],
+                    "role_confirmed": entry["role_confirmed"],
+                    "visibility_confirmed": entry["visibility_confirmed"],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_public_retry_recovers_a_queued_job_after_create_process_loss(
     course_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -658,6 +690,33 @@ async def test_chunked_multipart_limits_are_enforced_before_form_spooling(
 
     with pytest.raises(courses_router.InvalidCourseSourceError, match=message):
         await courses_router._parse_multipart_course(request)
+
+
+@pytest.mark.asyncio
+async def test_multipart_handoff_keeps_accepted_uploads_as_rewindable_streams() -> None:
+    from deeptutor.api.routers import courses as courses_router
+    from deeptutor.course_mode.source_processing import CourseUpload
+
+    body, content_type = _multipart_payload(
+        [
+            ("first.md", b"first source text"),
+            ("second.md", b"second source text"),
+        ]
+    )
+    request = _streaming_request(body, content_type, chunk_size=7)
+
+    _course_input, uploads = await courses_router._parse_multipart_course(request)
+    try:
+        assert all(isinstance(upload, CourseUpload) for upload in uploads)
+        assert all(upload.stream.seekable() for upload in uploads)
+        assert all(not isinstance(upload.stream, bytes) for upload in uploads)
+        assert [upload.stream.read() for upload in uploads] == [
+            b"first source text",
+            b"second source text",
+        ]
+    finally:
+        for upload in uploads:
+            upload.close()
 
 
 def test_chunked_multipart_endpoint_rejects_oversized_source_before_course_creation(

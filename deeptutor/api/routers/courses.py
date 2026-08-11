@@ -41,7 +41,9 @@ from deeptutor.course_mode.source_processing import (
     COURSE_MAX_FILE_BYTES,
     COURSE_MAX_TOTAL_BYTES,
     COURSE_MAX_UPLOAD_COUNT,
+    CourseUpload,
     InvalidCourseSourceError,
+    course_file_limit,
 )
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.multi_user.paths import get_current_course_path_service
@@ -131,10 +133,12 @@ class _CourseMultipartParser(MultiPartParser):
         )
         self._course_total_file_bytes = 0
         self._course_current_file_bytes = 0
+        self._course_current_file_limit = COURSE_MAX_FILE_BYTES
 
     def on_part_begin(self) -> None:
         super().on_part_begin()
         self._course_current_file_bytes = 0
+        self._course_current_file_limit = COURSE_MAX_FILE_BYTES
 
     def on_headers_finished(self) -> None:
         try:
@@ -145,6 +149,12 @@ class _CourseMultipartParser(MultiPartParser):
                     "Course source file count exceeds the request limit"
                 ) from exc
             raise
+        if self._current_part.file is not None:
+            filename = self._current_part.file.filename or ""
+            self._course_current_file_limit = course_file_limit(
+                filename,
+                max_file_bytes=COURSE_MAX_FILE_BYTES,
+            )
 
     def on_part_data(self, data: bytes, start: int, end: int) -> None:
         message_bytes = data[start:end]
@@ -152,7 +162,7 @@ class _CourseMultipartParser(MultiPartParser):
             super().on_part_data(data, start, end)
             return
         next_file_size = self._course_current_file_bytes + len(message_bytes)
-        if next_file_size > COURSE_MAX_FILE_BYTES:
+        if next_file_size > self._course_current_file_limit:
             raise MultiPartException("Uploaded source exceeds the per-file size limit")
         next_total_size = self._course_total_file_bytes + len(message_bytes)
         if next_total_size > COURSE_MAX_TOTAL_BYTES:
@@ -230,13 +240,14 @@ def _optional_form_text(value: Any) -> str | None:
         raise InvalidCourseInputError("Optional Course input is invalid") from exc
 
 
-async def _parse_multipart_course(request: Request) -> tuple[CourseInput, list[tuple[str, bytes]]]:
+async def _parse_multipart_course(request: Request) -> tuple[CourseInput, list[CourseUpload]]:
     content_type = request.headers.get("content-type", "").lower()
     if not content_type.startswith("multipart/form-data"):
         # The source-less JSON pilot contract is intentionally retired. Keep
         # this explicit so clients cannot accidentally create an unprocessable
         # Course while believing an upload was accepted.
         raise InvalidCourseSourceError("Course creation requires at least one uploaded source file")
+    uploads: list[CourseUpload] = []
     try:
         # Parse directly from the ASGI stream. Starlette's stock parser writes
         # file chunks as they arrive; the Course subclass rejects a chunk that
@@ -265,11 +276,17 @@ async def _parse_multipart_course(request: Request) -> tuple[CourseInput, list[t
             weekly_minutes = int(weekly_minutes_raw)
         except (TypeError, ValueError) as exc:
             raise InvalidCourseInputError("Weekly minutes must be an integer") from exc
-        uploads: list[tuple[str, bytes]] = []
         for field_name in ("files", "uploads", "source_files", "file"):
             for item in form.getlist(field_name):
                 if isinstance(item, StarletteUploadFile):
-                    uploads.append((item.filename or "", await item.read()))
+                    await item.seek(0)
+                    uploads.append(
+                        CourseUpload(
+                            filename=item.filename or "",
+                            stream=item.file,
+                            declared_size=item.size,
+                        )
+                    )
             if uploads:
                 break
         course_input = CourseInput(
@@ -286,9 +303,14 @@ async def _parse_multipart_course(request: Request) -> tuple[CourseInput, list[t
             accessibility=_optional_form_text(_form_value(form, "accessibility")),
         )
         return course_input, uploads
+    except Exception:
+        for upload in uploads:
+            upload.close()
+        raise
     finally:
+        returned_streams = {id(upload.stream) for upload in uploads}
         for _field_name, item in form.multi_items():
-            if isinstance(item, StarletteUploadFile):
+            if isinstance(item, StarletteUploadFile) and id(item.file) not in returned_streams:
                 await item.close()
 
 
@@ -306,6 +328,7 @@ async def create_course(
     response: Response,
     idempotency_key: IdempotencyKey,
 ) -> CreateCourseResponse:
+    uploads: list[CourseUpload] = []
     try:
         course_input, uploads = await _parse_multipart_course(request)
         repository = get_course_repository()
@@ -324,6 +347,9 @@ async def create_course(
             )
     except Exception as exc:
         raise _safe_error(exc, default="Course import could not be created") from exc
+    finally:
+        for upload in uploads:
+            await asyncio.to_thread(upload.close)
     response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     return _course_response(result)
 

@@ -182,6 +182,24 @@ test.describe('Course Mode workflow', () => {
           revision: number
           entries: Array<Record<string, unknown> & { id: string }>
         }
+        const allowedEntryFields = new Set([
+          'id',
+          'role',
+          'visibility',
+          'role_confirmed',
+          'visibility_confirmed',
+        ])
+        const unknownFields = body.entries.flatMap(entry =>
+          Object.keys(entry).filter(field => !allowedEntryFields.has(field))
+        )
+        if (unknownFields.length > 0) {
+          await route.fulfill({
+            status: 422,
+            contentType: 'application/json',
+            body: JSON.stringify({ detail: `Unknown manifest field: ${unknownFields[0]}` }),
+          })
+          return
+        }
         saveRevisions.push(body.revision)
         if (staleSaveCount > 0) {
           const remoteFilename = staleSaveCount === 2

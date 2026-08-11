@@ -3018,6 +3018,7 @@
   "Weekly minutes": "每周学习分钟数",
   "Source files": "源文件",
   "Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected.": "支持 PDF、DOCX、XLSX、PPTX 以及文本或 Markdown 文件。不接受图片、媒体、压缩包和空文件。",
+  "Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected. Upload limit: 100 MB per file (PDF 50 MB), 200 MB total.": "支持 PDF、DOCX、XLSX、PPTX 以及文本或 Markdown 文件。不接受图片、媒体、压缩包和空文件。上传限制：每个文件 100 MB（PDF 50 MB），总计 200 MB。",
   "Scheduling (optional)": "安排（可选）",
   "Saved for learner context only; DeepTutor never fetches this URL.": "仅保存用于学习上下文；DeepTutor 不会访问此 URL。",
   "Schedule": "学习安排",

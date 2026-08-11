@@ -60,6 +60,11 @@ test('Course detail spinners respect reduced-motion preferences', () => {
   assert.match(detail, /animate-spin motion-reduce:animate-none/)
 })
 
+test('Course gallery spinners respect reduced-motion preferences', () => {
+  assert.doesNotMatch(gallery, /animate-spin(?! motion-reduce:animate-none)/)
+  assert.match(gallery, /animate-spin motion-reduce:animate-none/)
+})
+
 test('queued imports expose recovery and completed manifests are read-only', () => {
   assert.match(detail, /Course import is queued/)
   assert.match(detail, /Resume processing/)
