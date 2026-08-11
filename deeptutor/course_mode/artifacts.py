@@ -162,6 +162,25 @@ def ensure_course_workspace(path_service: PathService, course_id: str) -> bool:
     )
 
 
+def ensure_course_private_directory(
+    path_service: PathService,
+    course_id: str,
+    relative_path: str,
+) -> Path:
+    """Create one Course-owned directory chain with no-follow traversal."""
+    normalized = normalize_artifact_relative_path(relative_path)
+    path_service.get_course_workspace(course_id)
+    components = (
+        *_course_storage_components(path_service),
+        "workspace",
+        "courses",
+        course_id,
+        *normalized.split("/"),
+    )
+    _ensure_directory_chain(path_service, components)
+    return path_service.get_course_workspace(course_id) / normalized
+
+
 def write_course_artifact_atomic(
     path_service: PathService,
     course_id: str,
@@ -337,6 +356,7 @@ __all__ = [
     "InvalidArtifactPathError",
     "UnsupportedCourseStorageError",
     "ensure_course_data_root",
+    "ensure_course_private_directory",
     "ensure_course_workspace",
     "normalize_artifact_relative_path",
     "open_course_artifact_for_read",

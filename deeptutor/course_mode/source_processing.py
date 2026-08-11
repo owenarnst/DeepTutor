@@ -8,14 +8,19 @@ state under that Course's server-only workspace.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Awaitable, Callable, Iterable, Protocol
+import stat
+from typing import Any, Awaitable, Callable, Iterable, Protocol
 import unicodedata
 from urllib.parse import unquote, urlsplit
+from uuid import UUID
 
 from deeptutor.services.rag.file_routing import FileTypeRouter
 from deeptutor.utils.document_extractor import extract_text_from_bytes
@@ -267,7 +272,7 @@ def infer_manifest_role(filename: str) -> RoleProposal:
 
 
 class CourseIngestionAdapter(Protocol):
-    """Private seam for the existing extraction/indexing machinery."""
+    """Private seam for the existing extraction/indexing/retrieval machinery."""
 
     def index_sources(
         self,
@@ -278,20 +283,215 @@ class CourseIngestionAdapter(Protocol):
         progress: Callable[[int, int], None] | None = None,
     ) -> None | Awaitable[None]: ...
 
+    def search(
+        self,
+        *,
+        course_id: str,
+        query: str,
+        workspace: Path,
+        top_k: int = 5,
+    ) -> Mapping[str, Any] | Awaitable[Mapping[str, Any]]: ...
+
 
 class DefaultCourseIngestionAdapter:
-    """Safe local adapter that records a Course-private text index manifest.
+    """Index and retrieve through DeepTutor's RAG service in Course storage.
 
-    Parsing is delegated to ``document_extractor`` before this adapter runs.
-    The index metadata is intentionally under server-private Course storage and
-    never enters the user KB registry. Deployments can inject the existing RAG
-    provider behind this interface without changing Course ownership.
+    The normal path invokes the repository's configured ``RAGService`` against
+    a Course-private namespace. It never creates a user-KB config entry, and
+    every source path is checked with no-follow metadata before the RAG engine
+    sees it. A bounded lexical index is retained only for minimal installations
+    where the optional LlamaIndex engine cannot import; it is still searchable,
+    persisted under the Course workspace, and never a user-KB metadata stub.
     """
 
-    def __init__(self, path_service: object | None = None) -> None:
+    def __init__(
+        self,
+        path_service: object | None = None,
+        *,
+        rag_service_factory: Callable[..., Any] | None = None,
+    ) -> None:
         self.path_service = path_service
+        self.rag_service_factory = rag_service_factory
 
-    def index_sources(
+    @staticmethod
+    def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        return stat.S_ISLNK(metadata.st_mode) or bool(
+            getattr(metadata, "st_file_attributes", 0) & reparse_flag
+        )
+
+    def _trusted_source_paths(
+        self,
+        source_paths: tuple[Path, ...],
+        workspace: Path,
+    ) -> tuple[Path, ...]:
+        """Return only regular files reached through a stable Course directory."""
+        workspace_path = Path(workspace)
+        if not workspace_path.is_absolute():
+            raise InvalidCourseSourceError("Course source workspace is invalid")
+        workspace_metadata = workspace_path.lstat()
+        if self._is_link_or_reparse(workspace_metadata) or not stat.S_ISDIR(
+            workspace_metadata.st_mode
+        ):
+            raise InvalidCourseSourceError("Course source workspace is invalid")
+
+        trusted: list[Path] = []
+        for candidate in source_paths:
+            candidate_path = Path(candidate)
+            if not candidate_path.is_absolute():
+                raise InvalidCourseSourceError("Course source path is invalid")
+            try:
+                relative = candidate_path.relative_to(workspace_path)
+            except ValueError as exc:
+                raise InvalidCourseSourceError(
+                    "Course source path is outside its workspace"
+                ) from exc
+            if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+                raise InvalidCourseSourceError("Course source path is invalid")
+            current = workspace_path
+            for index, component in enumerate(relative.parts):
+                current = current / component
+                metadata = current.lstat()
+                if self._is_link_or_reparse(metadata):
+                    raise InvalidCourseSourceError("Course source path contains a link")
+                if index == len(relative.parts) - 1 and not stat.S_ISREG(metadata.st_mode):
+                    raise InvalidCourseSourceError("Course source is not a regular file")
+            trusted.append(current)
+        if not trusted:
+            raise InvalidCourseSourceError("Course source inventory is empty")
+        return tuple(trusted)
+
+    def _private_index_root(self, course_id: str, workspace: Path) -> Path:
+        try:
+            if str(UUID(course_id)) != course_id:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise InvalidCourseSourceError("Course identity is invalid") from exc
+        if self.path_service is not None:
+            from .artifacts import ensure_course_private_directory
+
+            return ensure_course_private_directory(self.path_service, course_id, "private-index")
+        root = Path(workspace) / "private-index"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _rag_service(self, private_root: Path) -> Any:
+        factory = self.rag_service_factory
+        if factory is not None:
+            return factory(kb_base_dir=private_root, provider="llamaindex")
+        from deeptutor.services.rag.service import RAGService
+
+        return RAGService(kb_base_dir=str(private_root), provider="llamaindex")
+
+    async def _maybe_await(self, value: Any) -> Any:
+        return await value if inspect.isawaitable(value) else value
+
+    def _write_fallback_index(
+        self,
+        course_id: str,
+        private_root: Path,
+        source_paths: tuple[Path, ...],
+    ) -> None:
+        records: list[dict[str, str]] = []
+        for source_path in source_paths:
+            with source_path.open("rb") as handle:
+                content = handle.read(COURSE_MAX_FILE_BYTES + 1)
+            if len(content) > COURSE_MAX_FILE_BYTES:
+                raise InvalidCourseSourceError("Course source exceeds the size limit")
+            text = extract_text_from_bytes(
+                source_path.name,
+                content,
+                max_bytes=COURSE_MAX_FILE_BYTES,
+                max_chars=500_000,
+            ).strip()
+            if text:
+                records.append({"filename": source_path.name, "text": text})
+        if not records:
+            raise InvalidCourseSourceError("Course source inventory has no searchable text")
+        payload = json.dumps({"records": records}, ensure_ascii=False, sort_keys=True).encode(
+            "utf-8"
+        )
+        relative_path = "private-index/search-index.json"
+        if self.path_service is not None:
+            from .artifacts import write_course_artifact_atomic
+
+            write_course_artifact_atomic(self.path_service, course_id, relative_path, payload)
+        else:
+            private_root.mkdir(parents=True, exist_ok=True)
+            (private_root / "search-index.json").write_bytes(payload)
+
+    def _read_fallback_index(self, course_id: str, private_root: Path) -> dict[str, Any]:
+        if self.path_service is not None:
+            from .artifacts import open_course_artifact_for_read
+
+            with open_course_artifact_for_read(
+                self.path_service, course_id, "private-index/search-index.json"
+            ) as handle:
+                data = handle.read(64 * 1024 * 1024 + 1)
+        else:
+            data = (private_root / "search-index.json").read_bytes()
+        if len(data) > 64 * 1024 * 1024:
+            raise InvalidCourseSourceError("Course private index exceeds its size limit")
+        payload = json.loads(data.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+
+    def _fallback_search(
+        self,
+        course_id: str,
+        query: str,
+        private_root: Path,
+        top_k: int,
+    ) -> dict[str, Any]:
+        payload = self._read_fallback_index(course_id, private_root)
+        terms = tuple(dict.fromkeys(re.findall(r"[\w-]+", query.casefold())))
+        ranked: list[tuple[int, dict[str, str]]] = []
+        for record in payload.get("records", []):
+            if not isinstance(record, dict):
+                continue
+            text = str(record.get("text") or "")
+            score = sum(text.casefold().count(term) for term in terms)
+            if score:
+                ranked.append(
+                    (score, {"filename": str(record.get("filename") or ""), "text": text})
+                )
+        ranked.sort(key=lambda item: (-item[0], item[1]["filename"]))
+        selected = [record for _score, record in ranked[: max(1, min(top_k, 20))]]
+        content = "\n\n".join(record["text"] for record in selected)
+        return {
+            "query": query,
+            "answer": content,
+            "content": content,
+            "provider": "course-private-lexical",
+            "sources": [
+                {
+                    "title": record["filename"],
+                    "source": record["filename"],
+                    "content": record["text"][:200],
+                }
+                for record in selected
+            ],
+        }
+
+    @staticmethod
+    def _safe_result(result: Any, query: str) -> dict[str, Any]:
+        if not isinstance(result, Mapping):
+            raise RuntimeError("Course retrieval returned an invalid result")
+        safe = dict(result)
+        safe.setdefault("query", query)
+        safe.setdefault("answer", safe.get("content", ""))
+        safe.setdefault("content", safe.get("answer", ""))
+        sources: list[dict[str, Any]] = []
+        for source in safe.get("sources", []) or []:
+            if not isinstance(source, Mapping):
+                continue
+            item = dict(source)
+            raw_path = str(item.get("source") or "")
+            item["source"] = PurePosixPath(raw_path.replace("\\", "/")).name
+            sources.append(item)
+        safe["sources"] = sources
+        return safe
+
+    async def index_sources(
         self,
         *,
         course_id: str,
@@ -299,24 +499,47 @@ class DefaultCourseIngestionAdapter:
         workspace: Path,
         progress: Callable[[int, int], None] | None = None,
     ) -> None:
-        _ = workspace
-        payload = {
-            "sources": [path.name for path in source_paths],
-            "count": len(source_paths),
-        }
-        if self.path_service is not None:
-            # Import locally to keep the source-processing module's parser
-            # seam independent from filesystem implementation details.
-            from .artifacts import write_course_artifact_atomic
-
-            write_course_artifact_atomic(
-                self.path_service,  # type: ignore[arg-type]
-                course_id,
-                "private-index/sources.json",
-                json.dumps(payload, sort_keys=True).encode("utf-8"),
+        trusted = self._trusted_source_paths(source_paths, workspace)
+        private_root = self._private_index_root(course_id, workspace)
+        try:
+            service = self._rag_service(private_root)
+            result = await self._maybe_await(
+                service.initialize(
+                    kb_name=course_id,
+                    file_paths=[str(path) for path in trusted],
+                )
             )
+            if result is False:
+                raise RuntimeError("Course private indexing did not produce an index")
+        except ModuleNotFoundError:
+            # The source tree's minimal test environment omits LlamaIndex. The
+            # production dependency path above remains authoritative; this
+            # bounded fallback keeps Course retrieval restart-safe in stripped
+            # installs without pretending metadata is an index.
+            self._write_fallback_index(course_id, private_root, trusted)
         if progress:
-            progress(len(source_paths), len(source_paths))
+            progress(len(trusted), len(trusted))
+
+    async def search(
+        self,
+        *,
+        course_id: str,
+        query: str,
+        workspace: Path,
+        top_k: int = 5,
+    ) -> Mapping[str, Any]:
+        query = query.strip() if isinstance(query, str) else ""
+        if not query:
+            raise ValueError("Course retrieval query must be non-empty")
+        private_root = self._private_index_root(course_id, workspace)
+        try:
+            service = self._rag_service(private_root)
+            result = await self._maybe_await(
+                service.search(query=query, kb_name=course_id, top_k=max(1, min(top_k, 20)))
+            )
+            return self._safe_result(result, query)
+        except ModuleNotFoundError:
+            return self._fallback_search(course_id, query, private_root, top_k)
 
 
 __all__ = [

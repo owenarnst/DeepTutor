@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from deeptutor.course_mode.repository import (
     ManifestApprovalBlockedError,
     ManifestRevisionConflictError,
 )
+from deeptutor.course_mode.source_processing import DefaultCourseIngestionAdapter
 from deeptutor.services.path_service import PathService
 
 
@@ -339,3 +341,116 @@ def test_approval_rejects_empty_or_missing_manifest_entries(
     assert manifest.entries == ()
     with pytest.raises(InvalidManifestError, match="one entry per accepted source"):
         repository.approve_manifest(created.course.id, manifest.revision)
+
+
+def test_course_adapter_uses_private_rag_namespace_and_sanitizes_retrieval(
+    repository: CourseRepository,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeRagService:
+        async def initialize(self, **kwargs: object) -> bool:
+            calls["initialize"] = kwargs
+            return True
+
+        async def search(self, **kwargs: object) -> dict[str, object]:
+            calls["search"] = kwargs
+            return {
+                "query": kwargs["query"],
+                "answer": "private retrieval result",
+                "sources": [{"source": "/server/private/course/lecture.md"}],
+            }
+
+    def factory(**kwargs: object) -> FakeRagService:
+        calls["factory"] = kwargs
+        return FakeRagService()
+
+    adapter = DefaultCourseIngestionAdapter(
+        repository.path_service,
+        rag_service_factory=factory,
+    )
+    repository.ingestion_adapter = adapter
+    created = repository.create_import(
+        "import-private-rag",
+        _input(),
+        [("lecture.md", b"Vectors are independent directions.")],
+    )
+    processed = repository.process_import(created.processing_job.id)
+    assert processed.status is CourseJobStatus.AWAITING_MANIFEST_REVIEW
+
+    initialize = calls["initialize"]
+    assert isinstance(initialize, dict)
+    private_root = repository.path_service.get_course_workspace(created.course.id) / "private-index"
+    assert initialize["kb_name"] == created.course.id
+    assert initialize["file_paths"] == [
+        str(
+            repository.path_service.get_course_workspace(created.course.id)
+            / "sources"
+            / "lecture.md"
+        )
+    ]
+    assert calls["factory"] == {"kb_base_dir": private_root, "provider": "llamaindex"}
+
+    result = asyncio.run(
+        adapter.search(
+            course_id=created.course.id,
+            query="independent directions",
+            workspace=repository.path_service.get_course_workspace(created.course.id),
+        )
+    )
+    assert result["answer"] == "private retrieval result"
+    assert result["sources"] == [{"source": "lecture.md"}]
+    assert calls["search"] == {
+        "query": "independent directions",
+        "kb_name": created.course.id,
+        "top_k": 5,
+    }
+    assert not (private_root / "kb_config.json").exists()
+
+
+def test_default_adapter_fallback_is_searchable_and_course_private(
+    repository: CourseRepository,
+) -> None:
+    user_kb_root = repository.path_service.get_knowledge_bases_root()
+    user_kb_root.mkdir(parents=True)
+    sentinel = user_kb_root / "kb_config.json"
+    sentinel.write_text('{"knowledge_bases": {"user-kb": {}}}', encoding="utf-8")
+
+    def unavailable_rag(**_kwargs: object) -> object:
+        raise ModuleNotFoundError("llama_index")
+
+    adapter = DefaultCourseIngestionAdapter(
+        repository.path_service,
+        rag_service_factory=unavailable_rag,
+    )
+    repository.ingestion_adapter = adapter
+    created = repository.create_import(
+        "import-private-fallback",
+        _input(),
+        [("lecture.md", b"Vectors are independent directions.")],
+    )
+    repository.process_import(created.processing_job.id)
+    result = asyncio.run(
+        adapter.search(
+            course_id=created.course.id,
+            query="independent directions",
+            workspace=repository.path_service.get_course_workspace(created.course.id),
+        )
+    )
+
+    assert "independent directions" in result["answer"]
+    assert result["provider"] == "course-private-lexical"
+    assert result["sources"] == [
+        {
+            "title": "lecture.md",
+            "source": "lecture.md",
+            "content": "Vectors are independent directions.",
+        }
+    ]
+    assert sentinel.read_text(encoding="utf-8") == '{"knowledge_bases": {"user-kb": {}}}'
+    private_index = (
+        repository.path_service.get_course_workspace(created.course.id)
+        / "private-index"
+        / "search-index.json"
+    )
+    assert private_index.is_file()
