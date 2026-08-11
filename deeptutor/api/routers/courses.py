@@ -39,6 +39,7 @@ from deeptutor.course_mode.repository import (
 from deeptutor.course_mode.source_processing import (
     COURSE_MAX_FILE_BYTES,
     COURSE_MAX_TOTAL_BYTES,
+    COURSE_MAX_UPLOAD_COUNT,
     InvalidCourseSourceError,
 )
 from deeptutor.multi_user.context import get_current_user
@@ -210,11 +211,17 @@ async def _parse_multipart_course(request: Request) -> tuple[CourseInput, list[t
         raise InvalidCourseInputError("Weekly minutes must be an integer") from exc
     uploads: list[tuple[str, bytes]] = []
     total_upload_bytes = 0
+    upload_count = 0
     for field_name in ("files", "uploads", "source_files", "file"):
         for item in form.getlist(field_name):
             # Request.form() yields Starlette's base UploadFile even though
             # FastAPI exposes its subclass for endpoint annotations.
             if isinstance(item, StarletteUploadFile):
+                upload_count += 1
+                if upload_count > COURSE_MAX_UPLOAD_COUNT:
+                    raise InvalidCourseSourceError(
+                        "Course source file count exceeds the request limit"
+                    )
                 filename = item.filename or ""
                 content = await item.read(COURSE_MAX_FILE_BYTES + 1)
                 if len(content) > COURSE_MAX_FILE_BYTES:

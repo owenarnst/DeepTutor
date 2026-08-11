@@ -35,11 +35,15 @@ export default function CourseDetailPage() {
   const [manifest, setManifest] = useState<CourseManifest | null>(null)
   const [draftEntries, setDraftEntries] = useState<ManifestEntry[]>([])
   const [error, setError] = useState('')
+  const [processingError, setProcessingError] = useState('')
+  const [manifestError, setManifestError] = useState('')
   const [saving, setSaving] = useState(false)
   const [approving, setApproving] = useState(false)
 
   async function load() {
     setError('')
+    setProcessingError('')
+    setManifestError('')
     try {
       const courseResult = await coursesApi.get(params.courseId)
       setCourse(courseResult.course)
@@ -47,10 +51,21 @@ export default function CourseDetailPage() {
         coursesApi.processing(params.courseId),
         coursesApi.manifest(params.courseId),
       ])
-      if (processingResult.status === 'fulfilled') setJob(processingResult.value.job)
+      if (processingResult.status === 'fulfilled') {
+        setJob(processingResult.value.job)
+        setProcessingError('')
+      } else {
+        setJob(null)
+        setProcessingError(t('Could not read the durable processing state. Retry the status request.'))
+      }
       if (manifestResult.status === 'fulfilled') {
         setManifest(manifestResult.value)
         setDraftEntries(manifestResult.value.entries)
+        setManifestError('')
+      } else {
+        setManifest(null)
+        setDraftEntries([])
+        setManifestError(t('Could not read the source manifest. Retry the manifest request.'))
       }
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : t('Could not load course.'))
@@ -71,34 +86,70 @@ export default function CourseDetailPage() {
       try {
         const result = await coursesApi.processing(params.courseId)
         setJob(result.job)
+        setProcessingError('')
         if (result.job.status === 'awaiting_manifest_review') {
-          const nextManifest = await coursesApi.manifest(params.courseId)
-          setManifest(nextManifest)
-          setDraftEntries(nextManifest.entries)
+          try {
+            const nextManifest = await coursesApi.manifest(params.courseId)
+            setManifest(nextManifest)
+            setDraftEntries(nextManifest.entries)
+            setManifestError('')
+          } catch (reason: unknown) {
+            setManifestError(reason instanceof Error ? reason.message : t('Could not read the source manifest. Retry the manifest request.'))
+          }
         }
-      } catch {
-        // A transient poll failure is shown on the next explicit reload; avoid
-        // replacing durable stage state with a guessed client-side error.
+      } catch (reason: unknown) {
+        setProcessingError(reason instanceof Error ? reason.message : t('Could not read the durable processing state. Retry the status request.'))
       }
     }, 1200)
     return () => window.clearInterval(timer)
-  }, [job, params.courseId])
+  }, [job, params.courseId, t])
 
   const blockers = useMemo(() => manifest?.blockers || [], [manifest])
 
   async function retry() {
-    if (!job) return
+    const jobId = job?.id || course?.processing_job_id
+    if (!jobId) {
+      setProcessingError(t('Processing status is unavailable. Reload the course to retry its stage.'))
+      return
+    }
     setError('')
+    setProcessingError('')
     try {
-      const result = await coursesApi.retry(job.id)
+      const result = await coursesApi.retry(jobId)
       setJob(result.job)
       if (result.job.status === 'awaiting_manifest_review') {
-        const nextManifest = await coursesApi.manifest(params.courseId)
-        setManifest(nextManifest)
-        setDraftEntries(nextManifest.entries)
+        try {
+          const nextManifest = await coursesApi.manifest(params.courseId)
+          setManifest(nextManifest)
+          setDraftEntries(nextManifest.entries)
+          setManifestError('')
+        } catch (reason: unknown) {
+          setManifestError(reason instanceof Error ? reason.message : t('Could not read the source manifest. Retry the manifest request.'))
+        }
       }
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : t('Could not retry course processing.'))
+    }
+  }
+
+  async function retryProcessingStatus() {
+    setProcessingError('')
+    try {
+      const result = await coursesApi.processing(params.courseId)
+      setJob(result.job)
+    } catch (reason: unknown) {
+      setProcessingError(reason instanceof Error ? reason.message : t('Could not read the durable processing state. Retry the status request.'))
+    }
+  }
+
+  async function retryManifestRequest() {
+    setManifestError('')
+    try {
+      const result = await coursesApi.manifest(params.courseId)
+      setManifest(result)
+      setDraftEntries(result.entries)
+    } catch (reason: unknown) {
+      setManifestError(reason instanceof Error ? reason.message : t('Could not read the source manifest. Retry the manifest request.'))
     }
   }
 
@@ -154,7 +205,7 @@ export default function CourseDetailPage() {
   if (!course) {
     return (
       <div role="status" aria-live="polite" className="flex h-full items-center justify-center gap-2 text-sm text-[var(--muted-foreground)]">
-        <Loader2 size={16} className="animate-spin" /> {t('Loading course…')}
+        <Loader2 size={16} className="animate-spin motion-reduce:animate-none" /> {t('Loading course…')}
       </div>
     )
   }
@@ -170,13 +221,32 @@ export default function CourseDetailPage() {
         <header className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-6 shadow-sm">
           <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
             <span className="rounded-full bg-amber-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">{t('Draft')}</span>
-            <ProcessingStatus job={job} t={t} />
+            <ProcessingStatus job={job} error={processingError} t={t} />
           </div>
           <h1 className="text-3xl font-semibold tracking-tight text-[var(--foreground)]">{course.title}</h1>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-[var(--muted-foreground)]">{course.description || t('No description yet.')}</p>
         </header>
 
         {error && <div role="alert" aria-live="assertive" className="mt-5 rounded-lg border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">{error}</div>}
+
+        {processingError && (
+          <section aria-labelledby="course-processing-status-error" className="mt-6 rounded-2xl border border-rose-500/30 bg-rose-500/5 p-5">
+            <h2 id="course-processing-status-error" className="font-semibold text-[var(--foreground)]">{t('Processing status unavailable')}</h2>
+            <p role="alert" className="mt-2 text-sm text-[var(--muted-foreground)]">{processingError}</p>
+            <div className="mt-4 flex flex-wrap gap-3">
+              <button type="button" onClick={retryProcessingStatus} className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] px-4 text-xs font-medium text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2">{t('Retry status')}</button>
+              {(job?.id || course.processing_job_id) && <button type="button" onClick={retry} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2"><RefreshCw size={14} /> {t('Retry stage')}</button>}
+            </div>
+          </section>
+        )}
+
+        {manifestError && (
+          <section aria-labelledby="course-manifest-status-error" className="mt-6 rounded-2xl border border-rose-500/30 bg-rose-500/5 p-5">
+            <h2 id="course-manifest-status-error" className="font-semibold text-[var(--foreground)]">{t('Manifest unavailable')}</h2>
+            <p role="alert" className="mt-2 text-sm text-[var(--muted-foreground)]">{manifestError}</p>
+            <button type="button" onClick={retryManifestRequest} className="mt-4 inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] px-4 text-xs font-medium text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2">{t('Retry manifest')}</button>
+          </section>
+        )}
 
         {job?.status === 'failed' && (
           <section aria-labelledby="course-processing-error" className="mt-6 rounded-2xl border border-rose-500/30 bg-rose-500/5 p-5">
@@ -222,8 +292,9 @@ export default function CourseDetailPage() {
   )
 }
 
-function ProcessingStatus({ job, t }: { job: { status: CourseJobStatus } | null; t: (key: string) => string }) {
-  if (!job) return <span className="text-xs text-[var(--muted-foreground)]">{t('Course workspace ready')}</span>
+function ProcessingStatus({ job, error, t }: { job: { status: CourseJobStatus } | null; error: string; t: (key: string) => string }) {
+  if (error) return <span role="status" className="inline-flex items-center gap-1.5 text-xs text-rose-700 dark:text-rose-300"><RefreshCw size={14} />{t('Processing status unavailable')}</span>
+  if (!job) return <span role="status" className="text-xs text-[var(--muted-foreground)]">{t('Loading processing status…')}</span>
   const labels: Record<CourseJobStatus, string> = {
     queued: t('Queued'),
     source_processing: t('Processing sources'),
@@ -231,7 +302,7 @@ function ProcessingStatus({ job, t }: { job: { status: CourseJobStatus } | null;
     completed: t('Review complete'),
     failed: t('Processing failed'),
   }
-  return <span role="status" className="inline-flex items-center gap-1.5 text-xs text-[var(--muted-foreground)]">{job.status === 'completed' ? <CheckCircle2 size={14} /> : job.status !== 'failed' ? <Loader2 size={14} className="animate-spin" /> : null}{labels[job.status]}</span>
+  return <span role="status" className="inline-flex items-center gap-1.5 text-xs text-[var(--muted-foreground)]">{job.status === 'completed' ? <CheckCircle2 size={14} /> : job.status !== 'failed' ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : null}{labels[job.status]}</span>
 }
 
 function ManifestReview({
@@ -289,8 +360,8 @@ function ManifestReview({
         ))}
       </div>
       <div className="mt-5 flex flex-wrap items-center justify-end gap-3">
-        <button type="button" onClick={onSave} disabled={saving} className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] px-4 text-xs font-medium text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:opacity-50">{saving && <Loader2 size={14} className="animate-spin" />}{t('Save corrections')}</button>
-        <button type="button" onClick={onApprove} disabled={approving || blockers.length > 0} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:opacity-50">{approving && <Loader2 size={14} className="animate-spin" />}{t('Approve manifest')}</button>
+        <button type="button" onClick={onSave} disabled={saving} className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] px-4 text-xs font-medium text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:opacity-50">{saving && <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />}{t('Save corrections')}</button>
+        <button type="button" onClick={onApprove} disabled={approving || blockers.length > 0} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:opacity-50">{approving && <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />}{t('Approve manifest')}</button>
       </div>
       {manifest.eligible_for_planning && <div role="status" className="mt-4 flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-800 dark:text-emerald-200"><CheckCircle2 size={17} className="mt-0.5 shrink-0" /><span>{t('Ready for planning in OWE-8 / OWE-9. Course Mode does not generate a plan.')}</span></div>}
     </section>

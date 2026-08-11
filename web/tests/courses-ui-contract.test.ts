@@ -46,3 +46,16 @@ test('Course import UI captures the source contract and review workflow', () => 
   assert.match(detail, /Approve manifest/)
   assert.match(detail, /Retry stage/)
 })
+
+test('Course detail never treats rejected durable requests as ready', () => {
+  assert.match(detail, /Promise\.allSettled/)
+  assert.match(detail, /Processing status unavailable/)
+  assert.match(detail, /Manifest unavailable/)
+  assert.match(detail, /Retry status/)
+  assert.match(detail, /Retry manifest/)
+  assert.doesNotMatch(detail, /if \(!job\) return <span[^>]*>.*Course workspace ready/)
+})
+
+test('Course detail spinners respect reduced-motion preferences', () => {
+  assert.match(detail, /animate-spin motion-reduce:animate-none/)
+})

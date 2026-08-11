@@ -199,6 +199,52 @@ def prepare_upload_identity(
     return display_name, hashlib.sha256(content).hexdigest(), text, len(content)
 
 
+def validate_upload_batch_identity(
+    uploads: Iterable[tuple[str, bytes]],
+    *,
+    max_file_bytes: int = COURSE_MAX_FILE_BYTES,
+    max_total_bytes: int = COURSE_MAX_TOTAL_BYTES,
+) -> tuple[tuple[str, str, str, bytes, int], ...]:
+    """Validate cheap upload identity constraints without parsing file content.
+
+    This pass is safe to use before an idempotency replay lookup: it still
+    rejects path/extension/empty/size/count/duplicate violations, while
+    avoiding expensive Office/PDF/text extraction for a known accepted retry.
+    New requests always run the complete parser-backed validation afterwards.
+    """
+    identities: list[tuple[str, str, str, bytes, int]] = []
+    seen_names: set[str] = set()
+    seen_identities: set[tuple[str, str]] = set()
+    total = 0
+    for index, (filename, content) in enumerate(uploads):
+        if index >= COURSE_MAX_UPLOAD_COUNT:
+            raise InvalidCourseSourceError("Course source file count exceeds the request limit")
+        if not isinstance(content, bytes):
+            raise InvalidCourseSourceError("Uploaded content is invalid")
+        display_name = sanitize_upload_filename(filename)
+        if not content:
+            raise InvalidCourseSourceError(f"{display_name} is empty")
+        size = len(content)
+        if size > max_file_bytes:
+            raise InvalidCourseSourceError(f"{display_name} exceeds the upload size limit")
+        content_hash = hashlib.sha256(content).hexdigest()
+        name_key = display_name.casefold()
+        identity = (display_name, content_hash)
+        if name_key in seen_names:
+            raise InvalidCourseSourceError(f"Duplicate filename after sanitization: {display_name}")
+        if identity in seen_identities:
+            raise InvalidCourseSourceError("Duplicate uploaded source identity")
+        seen_names.add(name_key)
+        seen_identities.add(identity)
+        total += size
+        if total > max_total_bytes:
+            raise InvalidCourseSourceError("Uploaded Course sources exceed the batch size limit")
+        identities.append((filename, display_name, content_hash, content, size))
+    if not identities:
+        raise InvalidCourseSourceError("At least one supported text-extractable source is required")
+    return tuple(identities)
+
+
 def validate_upload_batch(
     uploads: Iterable[tuple[str, bytes]],
     *,
@@ -207,31 +253,19 @@ def validate_upload_batch(
 ) -> tuple[tuple[str, str, str, bytes, str, int], ...]:
     """Validate/extract every file before any Course filesystem mutation."""
     prepared: list[tuple[str, str, str, bytes, str, int]] = []
-    seen_names: set[str] = set()
-    seen_identities: set[tuple[str, str]] = set()
-    total = 0
-    for index, (filename, content) in enumerate(uploads):
-        if index >= COURSE_MAX_UPLOAD_COUNT:
-            raise InvalidCourseSourceError("Course source file count exceeds the request limit")
+    uploads = tuple(uploads)
+    identities = validate_upload_batch_identity(
+        uploads,
+        max_file_bytes=max_file_bytes,
+        max_total_bytes=max_total_bytes,
+    )
+    for filename, display_name, content_hash, content, size in identities:
         display_name, content_hash, text, size = prepare_upload_identity(
             filename,
             content,
             max_file_bytes=max_file_bytes,
         )
-        name_key = display_name.casefold()
-        if name_key in seen_names:
-            raise InvalidCourseSourceError(f"Duplicate filename after sanitization: {display_name}")
-        identity = (display_name, content_hash)
-        if identity in seen_identities:
-            raise InvalidCourseSourceError("Duplicate uploaded source identity")
-        seen_names.add(name_key)
-        seen_identities.add(identity)
-        total += size
-        if total > max_total_bytes:
-            raise InvalidCourseSourceError("Uploaded Course sources exceed the batch size limit")
         prepared.append((filename, display_name, content_hash, content, text, size))
-    if not prepared:
-        raise InvalidCourseSourceError("At least one supported text-extractable source is required")
     return tuple(prepared)
 
 
@@ -556,5 +590,6 @@ __all__ = [
     "normalize_ocw_url",
     "prepare_upload_identity",
     "sanitize_upload_filename",
+    "validate_upload_batch_identity",
     "validate_upload_batch",
 ]

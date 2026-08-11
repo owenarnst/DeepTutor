@@ -59,6 +59,32 @@ def test_import_is_idempotent_and_processes_exactly_one_source(
         )
 
 
+def test_idempotent_response_loss_replay_skips_expensive_extraction(
+    repository: CourseRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = repository.create_import(
+        "import-no-reparse",
+        _input(),
+        [("lecture.md", b"Vectors are independent directions.")],
+    )
+
+    import deeptutor.course_mode.repository as repository_module
+
+    def extraction_must_not_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("parser-backed extraction repeated a known idempotent retry")
+
+    monkeypatch.setattr(repository_module, "validate_upload_batch", extraction_must_not_run)
+    replay = repository.create_import(
+        "import-no-reparse",
+        _input(),
+        [("lecture.md", b"Vectors are independent directions.")],
+    )
+
+    assert replay.created is False
+    assert replay.course.id == first.course.id
+
+
 def test_concurrent_import_retries_share_one_course_job_and_source(
     repository: CourseRepository,
 ) -> None:

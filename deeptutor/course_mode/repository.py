@@ -42,6 +42,7 @@ from .source_processing import (
     InvalidCourseSourceError,
     infer_manifest_role,
     validate_upload_batch,
+    validate_upload_batch_identity,
 )
 
 _LATEST_SCHEMA_VERSION = 5
@@ -946,18 +947,57 @@ class CourseRepository:
         if not _REQUEST_KEY_RE.fullmatch(request_key):
             raise InvalidRequestKeyError("Idempotency key must be 1-128 URL-safe characters")
         normalized = _normalize_input(course_input, require_source=True)
-        try:
-            prepared = validate_upload_batch(uploads)
-        except InvalidCourseSourceError:
-            raise
+        uploads = tuple(uploads)
+        cheap_identities = validate_upload_batch_identity(uploads)
         upload_identities = tuple(
             sorted(
                 f"{display_name}\x00{content_hash}\x00{size}"
-                for _original_name, display_name, content_hash, _content, _text, size in prepared
+                for _original_name, display_name, content_hash, _content, size in cheap_identities
             )
         )
         request_fingerprint = _import_fingerprint(normalized, upload_identities)
         self.initialize()
+
+        # Check the authoritative replay row before expensive parser/extractor
+        # work. A response-loss retry still performs cheap identity validation,
+        # but a known accepted upload does not parse Office/PDF/text again.
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            prior = conn.execute(
+                """
+                SELECT request_fingerprint, course_id
+                FROM idempotency_keys
+                WHERE owner_scope = ? AND request_key = ?
+                """,
+                (self.owner_scope, request_key),
+            ).fetchone()
+            if prior is not None:
+                if prior["request_fingerprint"] != request_fingerprint:
+                    raise IdempotencyConflictError(
+                        "Idempotency key was already used with different course input"
+                    )
+                course = self._get_with_connection(conn, prior["course_id"])
+                job = self._job_with_connection(conn, course_id=prior["course_id"])
+                if course is None or job is None:
+                    raise RuntimeError("Idempotency record references incomplete Course state")
+                conn.commit()
+                return CourseImportResult(course=course, processing_job=job, created=False)
+            current_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM courses WHERE owner_scope = ?",
+                    (self.owner_scope,),
+                ).fetchone()[0]
+            )
+            if current_count >= self.max_courses:
+                raise CourseQuotaExceededError(
+                    f"Course limit reached ({self.max_courses} per owner)"
+                )
+            conn.commit()
+
+        try:
+            prepared = validate_upload_batch(uploads)
+        except InvalidCourseSourceError:
+            raise
 
         workspace_created = False
         written_paths: list[str] = []
