@@ -11,6 +11,8 @@ from deeptutor.course_mode.repository import (
     CourseRepository,
     IdempotencyConflictError,
     InvalidJobRetryError,
+    InvalidManifestError,
+    InvalidManifestStateError,
     ManifestApprovalBlockedError,
     ManifestRevisionConflictError,
 )
@@ -241,3 +243,99 @@ def test_concurrent_processing_claims_one_source_stage(
         is CourseJobStatus.AWAITING_MANIFEST_REVIEW
     )
     assert adapter.calls == 1
+
+
+def test_manifest_mutations_require_active_review_and_complete_inventory(
+    repository: CourseRepository,
+) -> None:
+    created = repository.create_import(
+        "import-state-guards",
+        _input(),
+        [("lecture.md", b"lecture"), ("reading.md", b"reading")],
+    )
+
+    with pytest.raises(InvalidManifestStateError):
+        repository.approve_manifest(created.course.id, 0)
+    with pytest.raises(InvalidManifestStateError):
+        repository.update_manifest(created.course.id, 0, [])
+
+    repository.process_import(created.processing_job.id)
+    manifest = repository.get_manifest(created.course.id)
+    with pytest.raises(InvalidManifestError, match="exactly one entry"):
+        repository.update_manifest(
+            created.course.id,
+            manifest.revision,
+            [{"id": manifest.entries[0].id, "role": ManifestRole.READING.value}],
+        )
+
+
+def test_failed_manifest_cannot_be_approved_or_edited(
+    repository: CourseRepository,
+) -> None:
+    class FailingAdapter:
+        def index_sources(self, **_kwargs: object) -> None:
+            raise RuntimeError("provider detail must not escape")
+
+    repository.ingestion_adapter = FailingAdapter()
+    created = repository.create_import(
+        "import-failed-manifest", _input(), [("lecture.md", b"lecture")]
+    )
+    failed = repository.process_import(created.processing_job.id)
+    assert failed.status is CourseJobStatus.FAILED
+
+    with pytest.raises(InvalidManifestStateError):
+        repository.approve_manifest(created.course.id, 0)
+    with pytest.raises(InvalidManifestStateError):
+        repository.update_manifest(created.course.id, 0, [])
+
+
+def test_completed_manifest_is_immutable_and_approval_is_not_repeatable(
+    repository: CourseRepository,
+) -> None:
+    created = repository.create_import(
+        "import-completed-guards", _input(), [("lecture.md", b"lecture")]
+    )
+    repository.process_import(created.processing_job.id)
+    manifest = repository.get_manifest(created.course.id)
+    corrected = repository.update_manifest(
+        created.course.id,
+        manifest.revision,
+        [
+            {
+                "id": manifest.entries[0].id,
+                "role": ManifestRole.LECTURE_NOTE.value,
+                "visibility": ManifestVisibility.LEARNER_VISIBLE.value,
+            }
+        ],
+    )
+    approved = repository.approve_manifest(created.course.id, corrected.revision)
+    assert approved.eligible_for_planning is True
+
+    with pytest.raises(InvalidManifestStateError):
+        repository.approve_manifest(created.course.id, approved.revision)
+    with pytest.raises(InvalidManifestStateError):
+        repository.update_manifest(
+            created.course.id,
+            approved.revision,
+            [{"id": manifest.entries[0].id, "role": ManifestRole.READING.value}],
+        )
+
+
+def test_approval_rejects_empty_or_missing_manifest_entries(
+    repository: CourseRepository,
+) -> None:
+    created = repository.create_import(
+        "import-missing-entry", _input(), [("lecture.md", b"lecture")]
+    )
+    repository.process_import(created.processing_job.id)
+    with repository._connect() as conn:
+        conn.execute(
+            "DELETE FROM course_manifest_entries WHERE course_id = ?",
+            (created.course.id,),
+        )
+        conn.commit()
+
+    manifest = repository.get_manifest(created.course.id)
+    assert manifest.entries == ()
+    with pytest.raises(InvalidManifestError, match="one entry per accepted source"):
+        repository.approve_manifest(created.course.id, manifest.revision)

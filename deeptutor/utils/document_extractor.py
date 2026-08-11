@@ -60,6 +60,14 @@ MAX_TOTAL_DOC_BYTES = 25 * 1024 * 1024
 MAX_EXTRACTED_CHARS_PER_DOC = 200_000
 MAX_EXTRACTED_CHARS_TOTAL = 150_000
 
+# Office Open XML is a ZIP package. These limits are checked from the central
+# directory before python-docx/openpyxl/python-pptx or the fallback XML parser
+# can read any member, bounding both archive metadata and expansion work.
+MAX_OOXML_MEMBER_COUNT = 2_048
+MAX_OOXML_MEMBER_EXPANDED_BYTES = 8 * 1024 * 1024
+MAX_OOXML_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_OOXML_COMPRESSION_RATIO = 200
+
 
 def _current_limits() -> tuple[int, int, int, int]:
     """(max_file_bytes, max_total_bytes, max_chars_per_doc, max_chars_total).
@@ -178,6 +186,9 @@ def extract_text_from_bytes(
         )
 
     _check_magic(ext, data, filename)
+
+    if ext in {".docx", ".xlsx", ".pptx"}:
+        _validate_ooxml_package(data, filename)
 
     if ext == ".pdf":
         text = _extract_pdf(data, filename)
@@ -403,11 +414,63 @@ def _extract_text_like(data: bytes, filename: str) -> str:
 
 
 def _open_ooxml(data: bytes, filename: str) -> zipfile.ZipFile:
+    _validate_ooxml_package(data, filename)
     try:
         return zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
         raise CorruptDocumentError(
             f"{filename}: failed to open Office ZIP package ({exc})", filename=filename
+        ) from exc
+
+
+def _validate_ooxml_package(data: bytes, filename: str) -> None:
+    """Reject ZIP expansion bombs before any Office parser consumes members."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_OOXML_MEMBER_COUNT:
+                raise CorruptDocumentError(
+                    f"{filename}: Office archive has too many members", filename=filename
+                )
+            expanded_total = 0
+            for member in members:
+                expanded_size = int(member.file_size)
+                compressed_size = int(member.compress_size)
+                if expanded_size < 0 or compressed_size < 0:
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive has invalid member sizes", filename=filename
+                    )
+                if expanded_size > MAX_OOXML_MEMBER_EXPANDED_BYTES:
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive member is too large", filename=filename
+                    )
+                expanded_total += expanded_size
+                if expanded_total > MAX_OOXML_EXPANDED_BYTES:
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive expands beyond its budget", filename=filename
+                    )
+                if (
+                    expanded_size
+                    and expanded_size / max(compressed_size, 1) > MAX_OOXML_COMPRESSION_RATIO
+                ):
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive compression ratio is unsafe", filename=filename
+                    )
+                member_name = member.filename.replace("\\", "/")
+                if (
+                    member_name.startswith("/")
+                    or "/../" in f"/{member_name}/"
+                    or "\x00" in member_name
+                ):
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive contains an unsafe member name",
+                        filename=filename,
+                    )
+    except CorruptDocumentError:
+        raise
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise CorruptDocumentError(
+            f"{filename}: failed to inspect Office archive", filename=filename
         ) from exc
 
 

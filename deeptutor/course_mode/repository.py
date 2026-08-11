@@ -95,6 +95,14 @@ class ManifestApprovalBlockedError(CourseModeError):
         super().__init__("Manifest review is not complete")
 
 
+class InvalidManifestStateError(CourseModeError):
+    """Raised when a manifest mutation is attempted outside review state."""
+
+
+class InvalidManifestError(CourseModeError):
+    """Raised when a manifest does not cover the accepted source inventory."""
+
+
 @dataclass(frozen=True)
 class CourseInput:
     title: str
@@ -1533,6 +1541,8 @@ class CourseRepository:
             job = self._job_with_connection(conn, course_id=canonical)
             if job is None:
                 raise InvalidCourseIdentifierError("Course manifest not found")
+            if job.status is not CourseJobStatus.AWAITING_MANIFEST_REVIEW:
+                raise InvalidManifestStateError("Manifest review is not active")
             if job.manifest_revision != expected_revision:
                 raise ManifestRevisionConflictError("Manifest revision is stale")
             current = {
@@ -1544,6 +1554,22 @@ class CourseRepository:
             }
             if not update_items:
                 raise InvalidCourseInputError("Manifest update must include entries")
+            source_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM course_sources WHERE course_id = ?",
+                    (canonical,),
+                ).fetchone()[0]
+            )
+            if not current or len(current) != source_count:
+                raise InvalidManifestError(
+                    "Manifest must contain exactly one entry per accepted source"
+                )
+            if len(update_items) != source_count or {
+                item.get("id") if isinstance(item, dict) else None for item in update_items
+            } != set(current):
+                raise InvalidManifestError(
+                    "Manifest updates must include exactly one entry per accepted source"
+                )
             now = datetime.now(timezone.utc).isoformat()
             seen_update_ids: set[str] = set()
             for update in update_items:
@@ -1641,9 +1667,21 @@ class CourseRepository:
             job = self._job_with_connection(conn, course_id=canonical)
             if job is None:
                 raise InvalidCourseIdentifierError("Course manifest not found")
+            if job.status is not CourseJobStatus.AWAITING_MANIFEST_REVIEW:
+                raise InvalidManifestStateError("Manifest approval is not active")
             if job.manifest_revision != expected_revision:
                 raise ManifestRevisionConflictError("Manifest revision is stale")
             entries = self._manifest_entries_with_connection(conn, canonical)
+            source_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM course_sources WHERE course_id = ?",
+                    (canonical,),
+                ).fetchone()[0]
+            )
+            if not entries or len(entries) != source_count:
+                raise InvalidManifestError(
+                    "Manifest must contain exactly one entry per accepted source"
+                )
             blockers = _manifest_blockers(entries)
             if blockers:
                 raise ManifestApprovalBlockedError(blockers)
@@ -1901,6 +1939,8 @@ __all__ = [
     "CourseRepository",
     "CreateCourseResult",
     "IdempotencyConflictError",
+    "InvalidManifestError",
+    "InvalidManifestStateError",
     "InvalidJobRetryError",
     "InvalidCourseIdentifierError",
     "InvalidCourseInputError",

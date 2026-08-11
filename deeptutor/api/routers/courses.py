@@ -30,6 +30,8 @@ from deeptutor.course_mode.repository import (
     InvalidCourseIdentifierError,
     InvalidCourseInputError,
     InvalidJobRetryError,
+    InvalidManifestError,
+    InvalidManifestStateError,
     InvalidRequestKeyError,
     ManifestApprovalBlockedError,
     ManifestRevisionConflictError,
@@ -132,8 +134,18 @@ def _safe_error(exc: Exception, *, default: str) -> HTTPException:
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, InvalidCourseIdentifierError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
-    if isinstance(exc, (InvalidCourseInputError, InvalidCourseSourceError, InvalidRequestKeyError)):
+    if isinstance(
+        exc,
+        (
+            InvalidCourseInputError,
+            InvalidCourseSourceError,
+            InvalidRequestKeyError,
+            InvalidManifestError,
+        ),
+    ):
         return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    if isinstance(exc, InvalidManifestStateError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, ManifestRevisionConflictError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if isinstance(exc, ManifestApprovalBlockedError):

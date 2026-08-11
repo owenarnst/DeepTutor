@@ -43,6 +43,7 @@ COURSE_SUPPORTED_EXTENSIONS = frozenset(
 COURSE_REJECTED_IMAGE_EXTENSIONS = frozenset(FileTypeRouter.IMAGE_EXTENSIONS | {".svg"})
 COURSE_MAX_FILE_BYTES = DocumentValidator.MAX_FILE_SIZE
 COURSE_MAX_TOTAL_BYTES = COURSE_MAX_FILE_BYTES * 5
+COURSE_MAX_UPLOAD_COUNT = 32
 _WINDOWS_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _BAD_FILENAME_CHARS = re.compile(r"[\x00-\x1f\x7f<>:\"/\\|?*]")
 _KNOWN_BINARY_MAGICS = (
@@ -204,7 +205,9 @@ def validate_upload_batch(
     seen_names: set[str] = set()
     seen_identities: set[tuple[str, str]] = set()
     total = 0
-    for filename, content in uploads:
+    for index, (filename, content) in enumerate(uploads):
+        if index >= COURSE_MAX_UPLOAD_COUNT:
+            raise InvalidCourseSourceError("Course source file count exceeds the request limit")
         display_name, content_hash, text, size = prepare_upload_identity(
             filename,
             content,
@@ -319,6 +322,7 @@ class DefaultCourseIngestionAdapter:
 __all__ = [
     "COURSE_MAX_FILE_BYTES",
     "COURSE_MAX_TOTAL_BYTES",
+    "COURSE_MAX_UPLOAD_COUNT",
     "COURSE_REJECTED_IMAGE_EXTENSIONS",
     "COURSE_SUPPORTED_EXTENSIONS",
     "CourseIngestionAdapter",

@@ -4,6 +4,7 @@ import pytest
 
 from deeptutor.course_mode.models import ManifestRole, ManifestVisibility
 from deeptutor.course_mode.source_processing import (
+    COURSE_MAX_UPLOAD_COUNT,
     InvalidCourseSourceError,
     infer_manifest_role,
     normalize_ocw_url,
@@ -11,6 +12,29 @@ from deeptutor.course_mode.source_processing import (
     sanitize_upload_filename,
     validate_upload_batch,
 )
+from deeptutor.utils.document_extractor import (
+    MAX_OOXML_MEMBER_COUNT,
+    MAX_OOXML_MEMBER_EXPANDED_BYTES,
+)
+
+
+def _ooxml_package(
+    *,
+    member_count: int = 1,
+    payload: bytes = (
+        b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        b"<w:body><w:p><w:r><w:t>safe</w:t></w:r></w:p></w:body></w:document>"
+    ),
+) -> bytes:
+    import io
+    import zipfile
+
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", payload)
+        for index in range(member_count - 1):
+            archive.writestr(f"word/extra-{index}.xml", b"x")
+    return stream.getvalue()
 
 
 def test_ocw_url_is_strict_and_keeps_the_original_path() -> None:
@@ -78,3 +102,47 @@ def test_control_heavy_text_extension_is_rejected_as_binary() -> None:
 def test_upload_batch_rejects_case_colliding_sanitized_names() -> None:
     with pytest.raises(InvalidCourseSourceError, match="Duplicate filename"):
         validate_upload_batch([("Lecture.md", b"one"), ("lecture.md", b"two")])
+
+
+def test_upload_request_has_a_file_count_budget() -> None:
+    uploads = [(f"note-{index}.md", b"text") for index in range(COURSE_MAX_UPLOAD_COUNT + 1)]
+
+    with pytest.raises(InvalidCourseSourceError, match="file count"):
+        validate_upload_batch(uploads)
+
+
+def test_normal_docx_is_extractable_after_ooxml_safety_check() -> None:
+    display, content_hash, text, size = prepare_upload_identity("lecture.docx", _ooxml_package())
+
+    assert display == "lecture.docx"
+    assert content_hash
+    assert "safe" in text
+    assert size > 0
+
+
+def test_ooxml_member_count_bomb_is_rejected_before_parser() -> None:
+    payload = _ooxml_package(member_count=MAX_OOXML_MEMBER_COUNT + 1)
+
+    with pytest.raises(InvalidCourseSourceError, match="no readable text"):
+        prepare_upload_identity("lecture.docx", payload)
+
+
+def test_ooxml_expanded_member_bomb_is_rejected_before_parser() -> None:
+    payload = _ooxml_package(
+        payload=b"<w:p>" + (b"x" * (MAX_OOXML_MEMBER_EXPANDED_BYTES + 1)) + b"</w:p>"
+    )
+
+    with pytest.raises(InvalidCourseSourceError, match="no readable text"):
+        prepare_upload_identity("lecture.docx", payload)
+
+
+def test_ooxml_compression_ratio_bomb_is_rejected_before_parser() -> None:
+    import io
+    import zipfile
+
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"<w:p>" + (b"A" * 1_000_000) + b"</w:p>")
+
+    with pytest.raises(InvalidCourseSourceError, match="no readable text"):
+        prepare_upload_identity("lecture.docx", stream.getvalue())
