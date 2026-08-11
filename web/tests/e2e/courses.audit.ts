@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import type { CourseManifest, CourseProcessingJob } from '../../lib/courses-api'
 
 const COURSE_ID = '11111111-1111-4111-8111-111111111111'
 
@@ -126,7 +127,8 @@ test.describe('Course Mode workflow', () => {
     await page.setViewportSize({ width: 390, height: 844 })
     await mockWorkspaceShellApi(page)
 
-    let staleSave = true
+    let staleSaveCount = 2
+    const saveRevisions: number[] = []
     let currentJob = { ...processingJob }
     let currentManifest = {
       ...manifest,
@@ -176,8 +178,25 @@ test.describe('Course Mode workflow', () => {
         return
       }
       if (request.method() === 'PATCH' && pathname.endsWith('/manifest')) {
-        if (staleSave) {
-          staleSave = false
+        const body = request.postDataJSON() as {
+          revision: number
+          entries: Array<Record<string, unknown> & { id: string }>
+        }
+        saveRevisions.push(body.revision)
+        if (staleSaveCount > 0) {
+          const remoteFilename = staleSaveCount === 2
+            ? 'answer-key-reviewed.pdf'
+            : 'answer-key-reviewed-again.pdf'
+          staleSaveCount -= 1
+          currentManifest = {
+            ...currentManifest,
+            revision: currentManifest.revision + 1,
+            entries: currentManifest.entries.map(entry =>
+              entry.id === '44444444-4444-4444-8444-444444444445'
+                ? { ...entry, display_filename: remoteFilename }
+                : entry
+            ),
+          }
           await route.fulfill({
             status: 409,
             contentType: 'application/json',
@@ -185,9 +204,13 @@ test.describe('Course Mode workflow', () => {
           })
           return
         }
-        const body = request.postDataJSON() as {
-          revision: number
-          entries: Array<Record<string, unknown> & { id: string }>
+        if (body.revision !== currentManifest.revision) {
+          await route.fulfill({
+            status: 409,
+            contentType: 'application/json',
+            body: JSON.stringify({ detail: 'Manifest revision is stale.' }),
+          })
+          return
         }
         currentManifest = {
           ...currentManifest,
@@ -230,17 +253,33 @@ test.describe('Course Mode workflow', () => {
     await page.getByLabel('Visibility').nth(1).selectOption('learner_visible')
 
     await page.getByRole('button', { name: 'Save corrections' }).click()
-    await expect(page.getByText('Manifest revision is stale.')).toBeVisible()
+    await expect(
+      page.getByText('Manifest changed while you were editing. Review refreshed values before saving.')
+    ).toBeVisible()
     // The failed 409 is intentionally part of this workflow; assert the
     // subsequent successful path independently of the browser's network log.
     unexpectedConsole.length = 0
+    await expect(page.getByText('Revision 2')).toBeVisible()
+    await expect(page.getByText('answer-key-reviewed.pdf')).toBeVisible()
+    await expect(page.getByLabel('Role').first()).toHaveValue('reading')
     await page.getByRole('button', { name: 'Save corrections' }).click()
+    await expect(
+      page.getByText('Manifest changed while you were editing. Review refreshed values before saving.')
+    ).toBeVisible()
+    await expect(page.getByText('Revision 3')).toBeVisible()
+    await expect(page.getByText('answer-key-reviewed-again.pdf')).toBeVisible()
+    await expect(page.getByLabel('Role').first()).toHaveValue('reading')
+    unexpectedConsole.length = 0
+    await page.getByRole('button', { name: 'Save corrections' }).click()
+    await expect.poll(() => saveRevisions).toEqual([1, 2, 3])
     await expect(page.getByText('Review blockers', { exact: true })).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Approve manifest' })).toBeEnabled()
 
     await page.getByRole('button', { name: 'Approve manifest' }).click()
     await expect(page.getByText(/Ready for planning in OWE-8 \/ OWE-9/)).toBeVisible()
     await expect(page.getByText('Review complete')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Save corrections' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Approve manifest' })).toHaveCount(0)
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)
     ).toBe(true)
@@ -250,12 +289,17 @@ test.describe('Course Mode workflow', () => {
     await page.reload()
     await expect(page.getByRole('heading', { name: '源清单审阅' })).toBeVisible()
     await expect(page.getByText(/已准备好交给 OWE-8 \/ OWE-9/)).toBeVisible()
+    await expect(page.getByRole('button', { name: '保存修正' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: '批准清单' })).toHaveCount(0)
     await page.screenshot({ path: testInfo.outputPath('course-review-390-zh.png'), fullPage: true })
 
     await page.evaluate(() => window.localStorage.setItem('deeptutor-language', 'en'))
     await page.reload()
     await expect(page.getByRole('heading', { name: 'Source manifest review' })).toBeVisible()
     await expect(page.getByText(/Ready for planning in OWE-8 \/ OWE-9/)).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Save corrections' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Approve manifest' })).toHaveCount(0)
+    expect(saveRevisions).toEqual([1, 2, 3])
     expect(unexpectedConsole).toEqual([])
   })
 
@@ -303,6 +347,67 @@ test.describe('Course Mode workflow', () => {
     await expect(page.getByRole('heading', { name: 'Source manifest review' })).toBeVisible()
     await expect(page.getByRole('heading', { name: 'Processing status unavailable' })).toHaveCount(0)
     await expect(page.getByRole('heading', { name: 'Manifest unavailable' })).toHaveCount(0)
+    expect(unexpectedConsole).toEqual([])
+  })
+
+  test('recovers a crash-queued import through public retry and reload', async ({ page }) => {
+    const unexpectedConsole = observeUnexpectedConsole(page)
+    await mockWorkspaceShellApi(page)
+    let processingReads = 0
+    let retryCalls = 0
+    let currentJob: CourseProcessingJob = {
+      ...processingJob,
+      status: 'queued',
+      stage: 'queued',
+      manifest_revision: 0,
+    } as CourseProcessingJob
+    let currentManifest: CourseManifest = {
+      ...manifest,
+      revision: 0,
+      entries: [],
+      blockers: [],
+      eligible_for_planning: false,
+    } as CourseManifest
+    await page.route('**/api/v1/courses**', async route => {
+      const request = route.request()
+      const { pathname } = new URL(request.url())
+      if (request.method() === 'GET' && pathname.endsWith('/processing')) {
+        processingReads += 1
+        await route.fulfill({ json: { job: currentJob } })
+        return
+      }
+      if (request.method() === 'GET' && pathname.endsWith('/manifest')) {
+        await route.fulfill({ json: currentManifest })
+        return
+      }
+      if (request.method() === 'GET' && pathname.endsWith(`/${COURSE_ID}`)) {
+        await route.fulfill({ json: { course } })
+        return
+      }
+      if (request.method() === 'POST' && pathname.endsWith(`/jobs/${processingJob.id}/retry`)) {
+        retryCalls += 1
+        currentJob = { ...processingJob } as CourseProcessingJob
+        currentManifest = { ...manifest } as CourseManifest
+        await route.fulfill({ json: { job: currentJob } })
+        return
+      }
+      await route.fallback()
+    })
+
+    await page.goto(`/courses/${COURSE_ID}`)
+    await expect(page.getByText('Queued — resume required')).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Course import is queued' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Resume processing' })).toBeVisible()
+    await page.waitForTimeout(1400)
+    expect(processingReads).toBe(1)
+
+    await page.getByRole('button', { name: 'Resume processing' }).click()
+    await expect(page.getByRole('heading', { name: 'Source manifest review' })).toBeVisible()
+    expect(retryCalls).toBe(1)
+
+    await page.reload()
+    await expect(page.getByRole('heading', { name: 'Source manifest review' })).toBeVisible()
+    await expect(page.getByText('Manifest review required')).toBeVisible()
     expect(unexpectedConsole).toEqual([])
   })
 

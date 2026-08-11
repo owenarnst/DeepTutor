@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from deeptutor.course_mode.models import (
     Course,
@@ -118,6 +119,49 @@ class ManifestApprovalRequest(BaseModel):
     revision: int = Field(ge=0)
 
 
+class _CourseMultipartParser(MultiPartParser):
+    """Stream Course uploads with byte budgets before Starlette writes chunks."""
+
+    def __init__(self, request: Request) -> None:
+        super().__init__(
+            request.headers,
+            request.stream(),
+            max_files=COURSE_MAX_UPLOAD_COUNT,
+            max_part_size=64 * 1024,
+        )
+        self._course_total_file_bytes = 0
+        self._course_current_file_bytes = 0
+
+    def on_part_begin(self) -> None:
+        super().on_part_begin()
+        self._course_current_file_bytes = 0
+
+    def on_headers_finished(self) -> None:
+        try:
+            super().on_headers_finished()
+        except MultiPartException as exc:
+            if str(exc).startswith("Too many files"):
+                raise MultiPartException(
+                    "Course source file count exceeds the request limit"
+                ) from exc
+            raise
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        message_bytes = data[start:end]
+        if self._current_part.file is None:
+            super().on_part_data(data, start, end)
+            return
+        next_file_size = self._course_current_file_bytes + len(message_bytes)
+        if next_file_size > COURSE_MAX_FILE_BYTES:
+            raise MultiPartException("Uploaded source exceeds the per-file size limit")
+        next_total_size = self._course_total_file_bytes + len(message_bytes)
+        if next_total_size > COURSE_MAX_TOTAL_BYTES:
+            raise MultiPartException("Uploaded Course sources exceed the batch size limit")
+        self._course_current_file_bytes = next_file_size
+        self._course_total_file_bytes = next_total_size
+        self._file_parts_to_write.append((self._current_part, message_bytes))
+
+
 def get_course_repository() -> CourseRepository:
     user = get_current_user()
     max_courses = load_system_settings()["course_max_per_owner"]
@@ -193,63 +237,59 @@ async def _parse_multipart_course(request: Request) -> tuple[CourseInput, list[t
         # this explicit so clients cannot accidentally create an unprocessable
         # Course while believing an upload was accepted.
         raise InvalidCourseSourceError("Course creation requires at least one uploaded source file")
-    form = await request.form()
-    if form.get("user_id") is not None or form.get("owner_scope") is not None:
-        raise InvalidCourseInputError("Course ownership is assigned by authentication")
-    title = _form_value(form, "title")
-    unit_title = _form_value(form, "unit_title", "unitTitle")
-    desired_outcome = _form_value(form, "desired_outcome", "desiredOutcome")
-    weekly_minutes_raw = _form_value(form, "weekly_minutes", "weeklyMinutes")
-    ocw_url = _form_value(form, "ocw_url", "ocwUrl", "source_url")
-    title_text = _required_form_text(title, "Title")
-    unit_title_text = _required_form_text(unit_title, "Unit title")
-    desired_outcome_text = _required_form_text(desired_outcome, "Desired outcome")
-    ocw_url_text = _required_form_text(ocw_url, "OCW URL")
     try:
-        weekly_minutes = int(weekly_minutes_raw)
-    except (TypeError, ValueError) as exc:
-        raise InvalidCourseInputError("Weekly minutes must be an integer") from exc
-    uploads: list[tuple[str, bytes]] = []
-    total_upload_bytes = 0
-    upload_count = 0
-    for field_name in ("files", "uploads", "source_files", "file"):
-        for item in form.getlist(field_name):
-            # Request.form() yields Starlette's base UploadFile even though
-            # FastAPI exposes its subclass for endpoint annotations.
+        # Parse directly from the ASGI stream. Starlette's stock parser writes
+        # file chunks as they arrive; the Course subclass rejects a chunk that
+        # would cross any budget before that chunk is queued for its temp file.
+        form = await _CourseMultipartParser(request).parse()
+    except MultiPartException as exc:
+        raise InvalidCourseSourceError(str(exc)) from exc
+    except Exception as exc:
+        raise InvalidCourseSourceError(
+            "Course multipart payload is invalid or exceeds request limits"
+        ) from exc
+
+    try:
+        if form.get("user_id") is not None or form.get("owner_scope") is not None:
+            raise InvalidCourseInputError("Course ownership is assigned by authentication")
+        title = _form_value(form, "title")
+        unit_title = _form_value(form, "unit_title", "unitTitle")
+        desired_outcome = _form_value(form, "desired_outcome", "desiredOutcome")
+        weekly_minutes_raw = _form_value(form, "weekly_minutes", "weeklyMinutes")
+        ocw_url = _form_value(form, "ocw_url", "ocwUrl", "source_url")
+        title_text = _required_form_text(title, "Title")
+        unit_title_text = _required_form_text(unit_title, "Unit title")
+        desired_outcome_text = _required_form_text(desired_outcome, "Desired outcome")
+        ocw_url_text = _required_form_text(ocw_url, "OCW URL")
+        try:
+            weekly_minutes = int(weekly_minutes_raw)
+        except (TypeError, ValueError) as exc:
+            raise InvalidCourseInputError("Weekly minutes must be an integer") from exc
+        uploads: list[tuple[str, bytes]] = []
+        for field_name in ("files", "uploads", "source_files", "file"):
+            for item in form.getlist(field_name):
+                if isinstance(item, StarletteUploadFile):
+                    uploads.append((item.filename or "", await item.read()))
+            if uploads:
+                break
+        course_input = CourseInput(
+            title=title_text,
+            description=_required_form_text(
+                _form_value(form, "description", default=""), "Description"
+            ),
+            unit_title=unit_title_text,
+            desired_outcome=desired_outcome_text,
+            weekly_minutes=weekly_minutes,
+            ocw_url=ocw_url_text,
+            scheduling=_optional_form_text(_form_value(form, "scheduling", "schedule")),
+            difficulty=_optional_form_text(_form_value(form, "difficulty")),
+            accessibility=_optional_form_text(_form_value(form, "accessibility")),
+        )
+        return course_input, uploads
+    finally:
+        for _field_name, item in form.multi_items():
             if isinstance(item, StarletteUploadFile):
-                upload_count += 1
-                if upload_count > COURSE_MAX_UPLOAD_COUNT:
-                    raise InvalidCourseSourceError(
-                        "Course source file count exceeds the request limit"
-                    )
-                filename = item.filename or ""
-                content = await item.read(COURSE_MAX_FILE_BYTES + 1)
-                if len(content) > COURSE_MAX_FILE_BYTES:
-                    raise InvalidCourseSourceError(
-                        "Uploaded source exceeds the per-file size limit"
-                    )
-                total_upload_bytes += len(content)
-                if total_upload_bytes > COURSE_MAX_TOTAL_BYTES:
-                    raise InvalidCourseSourceError(
-                        "Uploaded Course sources exceed the batch size limit"
-                    )
-                uploads.append((filename, content))
-        if uploads:
-            break
-    course_input = CourseInput(
-        title=title_text,
-        description=_required_form_text(
-            _form_value(form, "description", default=""), "Description"
-        ),
-        unit_title=unit_title_text,
-        desired_outcome=desired_outcome_text,
-        weekly_minutes=weekly_minutes,
-        ocw_url=ocw_url_text,
-        scheduling=_optional_form_text(_form_value(form, "scheduling", "schedule")),
-        difficulty=_optional_form_text(_form_value(form, "difficulty")),
-        accessibility=_optional_form_text(_form_value(form, "accessibility")),
-    )
-    return course_input, uploads
+                await item.close()
 
 
 def _course_response(result: CourseImportResult) -> CreateCourseResponse:

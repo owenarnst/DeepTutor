@@ -85,6 +85,92 @@ def test_idempotent_response_loss_replay_skips_expensive_extraction(
     assert replay.course.id == first.course.id
 
 
+def test_queued_job_can_be_resumed_after_process_restart(
+    repository: CourseRepository,
+) -> None:
+    class CountingAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def index_sources(self, **_kwargs: object) -> None:
+            self.calls += 1
+
+    adapter = CountingAdapter()
+    created = repository.create_import(
+        "import-queued-recovery",
+        _input(),
+        [("lecture.md", b"Vectors are independent directions.")],
+    )
+    assert created.processing_job.status is CourseJobStatus.QUEUED
+
+    reopened = CourseRepository(
+        repository.path_service,
+        owner_scope="user-a",
+        ingestion_adapter=adapter,
+    )
+    resumed = reopened.retry_import(created.processing_job.id)
+
+    assert resumed.status is CourseJobStatus.AWAITING_MANIFEST_REVIEW
+    assert adapter.calls == 1
+    assert len(reopened.get_manifest(created.course.id).entries) == 1
+
+
+def test_concurrent_queued_retries_share_one_recovery_claim(
+    repository: CourseRepository,
+) -> None:
+    from threading import Lock
+    import time
+
+    class CountingAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._lock = Lock()
+
+        def index_sources(self, **_kwargs: object) -> None:
+            with self._lock:
+                self.calls += 1
+            time.sleep(0.03)
+
+    adapter = CountingAdapter()
+    created = repository.create_import(
+        "import-queued-concurrent-recovery",
+        _input(),
+        [("lecture.md", b"Vectors are independent directions.")],
+    )
+
+    def retry_once(_: int) -> CourseJobStatus | InvalidJobRetryError:
+        worker = CourseRepository(
+            repository.path_service,
+            owner_scope="user-a",
+            ingestion_adapter=adapter,
+        )
+
+        try:
+            return worker.retry_import(created.processing_job.id).status
+        except InvalidJobRetryError as exc:
+            # A caller that arrives after the recovery lease has completed
+            # observes the non-failed state and must be rejected safely rather
+            # than starting a second indexing pass.
+            return exc
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        statuses = list(pool.map(retry_once, range(12)))
+
+    completed_statuses = [status for status in statuses if isinstance(status, CourseJobStatus)]
+    retry_errors = [status for status in statuses if isinstance(status, InvalidJobRetryError)]
+    assert set(completed_statuses) <= {
+        CourseJobStatus.SOURCE_PROCESSING,
+        CourseJobStatus.AWAITING_MANIFEST_REVIEW,
+    }
+    assert retry_errors
+    assert (
+        repository.get_processing_job(created.course.id).status
+        is CourseJobStatus.AWAITING_MANIFEST_REVIEW
+    )
+    assert adapter.calls == 1
+    assert len(repository.get_manifest(created.course.id).entries) == 1
+
+
 def test_concurrent_import_retries_share_one_course_job_and_source(
     repository: CourseRepository,
 ) -> None:

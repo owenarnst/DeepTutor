@@ -101,6 +101,16 @@ export interface CourseListPage {
   next_offset: number | null
 }
 
+export class CoursesApiError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'CoursesApiError'
+    this.status = status
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await apiFetch(apiUrl(`${BASE}${path}`), init)
   if (!response.ok) {
@@ -111,7 +121,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // The status text remains a safe fallback for non-JSON proxy failures.
     }
-    throw new Error(detail)
+    throw new CoursesApiError(detail, response.status)
   }
   return (await response.json()) as T
 }

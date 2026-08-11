@@ -13,6 +13,7 @@ from deeptutor.course_mode.source_processing import (
     validate_upload_batch,
 )
 from deeptutor.utils.document_extractor import (
+    MAX_OOXML_EXPANDED_BYTES,
     MAX_OOXML_MEMBER_COUNT,
     MAX_OOXML_MEMBER_EXPANDED_BYTES,
 )
@@ -21,6 +22,7 @@ from deeptutor.utils.document_extractor import (
 def _ooxml_package(
     *,
     member_count: int = 1,
+    extra_payload: bytes = b"x",
     payload: bytes = (
         b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
         b"<w:body><w:p><w:r><w:t>safe</w:t></w:r></w:p></w:body></w:document>"
@@ -33,7 +35,7 @@ def _ooxml_package(
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("word/document.xml", payload)
         for index in range(member_count - 1):
-            archive.writestr(f"word/extra-{index}.xml", b"x")
+            archive.writestr(f"word/extra-{index}.xml", extra_payload)
     return stream.getvalue()
 
 
@@ -134,6 +136,18 @@ def test_ooxml_expanded_member_bomb_is_rejected_before_parser() -> None:
 
     with pytest.raises(InvalidCourseSourceError, match="no readable text"):
         prepare_upload_identity("lecture.docx", payload)
+
+
+def test_ooxml_aggregate_expansion_bomb_is_rejected_before_parser() -> None:
+    import random
+
+    member_size = (MAX_OOXML_EXPANDED_BYTES // 8) - 32
+    random_source = random.Random(7)
+    payload = random_source.randbytes(member_size)
+    package = _ooxml_package(member_count=9, payload=payload, extra_payload=payload)
+
+    with pytest.raises(InvalidCourseSourceError, match="no readable text"):
+        prepare_upload_identity("lecture.docx", package)
 
 
 def test_ooxml_compression_ratio_bomb_is_rejected_before_parser() -> None:

@@ -107,6 +107,78 @@ def _plant_runner_visible_course_storage(
     return planted.model_dump(mode="json")
 
 
+def _multipart_payload(
+    files: list[tuple[str, bytes]],
+    *,
+    boundary: str = "owe7-streaming-boundary",
+) -> tuple[bytes, str]:
+    chunks: list[bytes] = []
+    fields = {
+        "title": "Streaming limits",
+        "description": "A bounded request",
+        "unit_title": "Unit 1",
+        "desired_outcome": "Read the source",
+        "weekly_minutes": "30",
+        "ocw_url": "https://ocw.mit.edu/courses/18-06/",
+    }
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode(),
+                b"\r\n",
+            ]
+        )
+    for filename, content in files:
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                (
+                    'Content-Disposition: form-data; name="files"; '
+                    f'filename="{filename}"\r\nContent-Type: text/plain\r\n\r\n'
+                ).encode(),
+                content,
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def _streaming_request(body: bytes, content_type: str, *, chunk_size: int = 5):
+    from starlette.requests import Request
+
+    chunks = [body[index : index + chunk_size] for index in range(0, len(body), chunk_size)]
+    cursor = 0
+
+    async def receive() -> dict[str, object]:
+        nonlocal cursor
+        if cursor >= len(chunks):
+            return {"type": "http.request", "body": b"", "more_body": False}
+        chunk = chunks[cursor]
+        cursor += 1
+        return {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": cursor < len(chunks),
+        }
+
+    class StreamingRequest(Request):
+        async def form(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("the route must enforce limits during streaming parse")
+
+    return StreamingRequest(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/courses",
+            "headers": [(b"content-type", content_type.encode())],
+        },
+        receive,
+    )
+
+
 def test_create_list_and_reopen_draft(course_client: TestClient) -> None:
     response = _create_course(
         course_client,
@@ -497,6 +569,118 @@ def test_import_exposes_durable_processing_and_manifest_review(course_client: Te
     assert approved.status_code == 200
     assert approved.json()["eligible_for_planning"] is True
     assert approved.json()["course_id"] == payload["course"]["id"]
+
+
+def test_public_retry_recovers_a_queued_job_after_create_process_loss(
+    course_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.course_mode.repository import CourseRepository
+
+    original_process_import = CourseRepository.process_import
+
+    def process_lost_after_create(self: CourseRepository, job_id: str):
+        job = self.get_processing_job_by_id(job_id)
+        assert job is not None
+        return job
+
+    monkeypatch.setattr(CourseRepository, "process_import", process_lost_after_create)
+    created = _create_course(
+        course_client,
+        key="queued-process-loss",
+        title="Queued recovery",
+    )
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["processing_job"]["status"] == "queued"
+
+    monkeypatch.setattr(CourseRepository, "process_import", original_process_import)
+    retry = course_client.post(
+        f"/api/v1/courses/jobs/{payload['processing_job']['id']}/retry",
+        headers=_auth(),
+    )
+
+    assert retry.status_code == 200
+    assert retry.json()["job"]["status"] == "awaiting_manifest_review"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("files", "file_limit", "total_limit", "count_limit", "message"),
+    [
+        (
+            [
+                ("large.md", b"x" * 17),
+            ],
+            16,
+            64,
+            4,
+            "per-file",
+        ),
+        (
+            [
+                ("first.md", b"x" * 13),
+                ("second.md", b"y" * 13),
+            ],
+            16,
+            24,
+            4,
+            "batch size",
+        ),
+        (
+            [
+                ("one.md", b"one"),
+                ("two.md", b"two"),
+                ("three.md", b"three"),
+            ],
+            16,
+            64,
+            2,
+            "file count",
+        ),
+    ],
+)
+async def test_chunked_multipart_limits_are_enforced_before_form_spooling(
+    monkeypatch: pytest.MonkeyPatch,
+    files: list[tuple[str, bytes]],
+    file_limit: int,
+    total_limit: int,
+    count_limit: int,
+    message: str,
+) -> None:
+    from deeptutor.api.routers import courses as courses_router
+
+    monkeypatch.setattr(courses_router, "COURSE_MAX_FILE_BYTES", file_limit)
+    monkeypatch.setattr(courses_router, "COURSE_MAX_TOTAL_BYTES", total_limit)
+    monkeypatch.setattr(courses_router, "COURSE_MAX_UPLOAD_COUNT", count_limit)
+    body, content_type = _multipart_payload(files)
+    request = _streaming_request(body, content_type, chunk_size=3)
+
+    with pytest.raises(courses_router.InvalidCourseSourceError, match=message):
+        await courses_router._parse_multipart_course(request)
+
+
+def test_chunked_multipart_endpoint_rejects_oversized_source_before_course_creation(
+    course_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.api.routers import courses as courses_router
+
+    monkeypatch.setattr(courses_router, "COURSE_MAX_FILE_BYTES", 16)
+    body, content_type = _multipart_payload([("large.md", b"x" * 17)])
+    chunks = (body[index : index + 3] for index in range(0, len(body), 3))
+    response = course_client.post(
+        "/api/v1/courses",
+        headers={
+            **_auth(),
+            "Idempotency-Key": "chunked-oversize",
+            "Content-Type": content_type,
+        },
+        content=chunks,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Uploaded source exceeds the per-file size limit"
 
 
 def test_import_rejects_source_less_json_and_unsafe_or_unsupported_uploads(

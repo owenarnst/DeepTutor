@@ -59,3 +59,13 @@ test('Course detail never treats rejected durable requests as ready', () => {
 test('Course detail spinners respect reduced-motion preferences', () => {
   assert.match(detail, /animate-spin motion-reduce:animate-none/)
 })
+
+test('queued imports expose recovery and completed manifests are read-only', () => {
+  assert.match(detail, /Course import is queued/)
+  assert.match(detail, /Resume processing/)
+  assert.match(detail, /status !== 'source_processing'/)
+  assert.match(detail, /reconcileManifestEntries/)
+  assert.match(detail, /readOnly=\{job\?\.status === 'completed' \|\| manifest\.eligible_for_planning\}/)
+  assert.match(detail, /!readOnly && <div className="mt-5/)
+  assert.match(detail, /disabled={readOnly}/)
+})

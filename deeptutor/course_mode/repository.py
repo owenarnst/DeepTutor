@@ -1451,6 +1451,14 @@ class CourseRepository:
                 if row["lease_until"] and row["lease_until"] > now:
                     raise InvalidJobRetryError("Processing job is still active")
                 conn.commit()
+            elif row["status"] == CourseJobStatus.QUEUED.value:
+                # A committed queued row is the durable hand-off point. It can
+                # remain after a worker/process crash before the API's
+                # best-effort inline runner starts. Release the short
+                # transaction before claiming it so concurrent public
+                # recovery requests converge through process_import's lease
+                # claim instead of duplicating indexing or manifest rows.
+                conn.commit()
             elif row["status"] != CourseJobStatus.FAILED.value:
                 raise InvalidJobRetryError("Only failed processing jobs can be retried")
             elif row["failed_stage"] != CourseJobStage.SOURCE_PROCESSING.value:

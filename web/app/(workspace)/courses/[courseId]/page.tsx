@@ -8,6 +8,7 @@ import { useTranslation } from 'react-i18next'
 
 import {
   coursesApi,
+  CoursesApiError,
   type Course,
   type CourseJobStatus,
   type CourseManifest,
@@ -26,6 +27,39 @@ const ROLES: ManifestRole[] = [
   'unknown',
 ]
 const VISIBILITIES: ManifestVisibility[] = ['learner_visible', 'instructor_only']
+const MANIFEST_EDITABLE_FIELDS = [
+  'role',
+  'visibility',
+  'role_confirmed',
+  'visibility_confirmed',
+] as const
+
+function reconcileManifestEntries(
+  baseEntries: ManifestEntry[],
+  draftEntries: ManifestEntry[],
+  latestEntries: ManifestEntry[],
+) {
+  const conflicts: string[] = []
+  const baseById = new Map(baseEntries.map(entry => [entry.id, entry]))
+  const draftById = new Map(draftEntries.map(entry => [entry.id, entry]))
+  const entries = latestEntries.map(latest => {
+    const base = baseById.get(latest.id)
+    const draft = draftById.get(latest.id)
+    if (!base || !draft) return latest
+    const merged = { ...latest }
+    for (const field of MANIFEST_EDITABLE_FIELDS) {
+      const localChanged = draft[field] !== base[field]
+      const remoteChanged = latest[field] !== base[field]
+      if (localChanged && !remoteChanged) {
+        Object.assign(merged, { [field]: draft[field] })
+      } else if (localChanged && remoteChanged && draft[field] !== latest[field]) {
+        conflicts.push(`${latest.display_filename}:${field}`)
+      }
+    }
+    return merged
+  })
+  return { entries, conflicts }
+}
 
 export default function CourseDetailPage() {
   const { t } = useTranslation()
@@ -81,7 +115,7 @@ export default function CourseDetailPage() {
   }, [params.courseId])
 
   useEffect(() => {
-    if (!job || (job.status !== 'queued' && job.status !== 'source_processing')) return
+    if (!job || job.status !== 'source_processing') return
     const timer = window.setInterval(async () => {
       try {
         const result = await coursesApi.processing(params.courseId)
@@ -159,6 +193,8 @@ export default function CourseDetailPage() {
 
   async function saveManifest() {
     if (!manifest) return
+    const baseManifest = manifest
+    const draftSnapshot = draftEntries
     setSaving(true)
     setError('')
     try {
@@ -167,7 +203,32 @@ export default function CourseDetailPage() {
       setDraftEntries(next.entries)
       setJob(current => (current ? { ...current, manifest_revision: next.revision } : current))
     } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : t('Could not save manifest.'))
+      if (reason instanceof CoursesApiError && reason.status === 409) {
+        try {
+          const latest = await coursesApi.manifest(params.courseId)
+          const reconciled = reconcileManifestEntries(
+            baseManifest.entries,
+            draftSnapshot,
+            latest.entries,
+          )
+          setManifest(latest)
+          setDraftEntries(reconciled.entries)
+          setJob(current => (current ? { ...current, manifest_revision: latest.revision } : current))
+          setError(
+            reconciled.conflicts.length > 0
+              ? t('Manifest changed with conflicting corrections. Review the highlighted values before saving.')
+              : t('Manifest changed while you were editing. Review refreshed values before saving.'),
+          )
+        } catch (refreshReason: unknown) {
+          setError(
+            refreshReason instanceof Error
+              ? refreshReason.message
+              : t('Could not refresh the manifest after a stale revision.'),
+          )
+        }
+      } else {
+        setError(reason instanceof Error ? reason.message : t('Could not save manifest.'))
+      }
     } finally {
       setSaving(false)
     }
@@ -248,6 +309,16 @@ export default function CourseDetailPage() {
           </section>
         )}
 
+        {job?.status === 'queued' && (
+          <section aria-labelledby="course-processing-queued" className="mt-6 rounded-2xl border border-amber-500/30 bg-amber-500/5 p-5">
+            <h2 id="course-processing-queued" className="font-semibold text-[var(--foreground)]">{t('Course import is queued')}</h2>
+            <p className="mt-2 text-sm text-[var(--muted-foreground)]">{t('Processing did not start before the last session ended. Resume it when you are ready.')}</p>
+            <button type="button" onClick={retry} className="mt-4 inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2">
+              <RefreshCw size={14} /> {t('Resume processing')}
+            </button>
+          </section>
+        )}
+
         {job?.status === 'failed' && (
           <section aria-labelledby="course-processing-error" className="mt-6 rounded-2xl border border-rose-500/30 bg-rose-500/5 p-5">
             <h2 id="course-processing-error" className="font-semibold text-[var(--foreground)]">{t('Course processing needs attention')}</h2>
@@ -264,6 +335,7 @@ export default function CourseDetailPage() {
             manifest={manifest}
             entries={draftEntries}
             blockers={blockers}
+            readOnly={job?.status === 'completed' || manifest.eligible_for_planning}
             saving={saving}
             approving={approving}
             onUpdate={updateEntry}
@@ -296,19 +368,20 @@ function ProcessingStatus({ job, error, t }: { job: { status: CourseJobStatus } 
   if (error) return <span role="status" className="inline-flex items-center gap-1.5 text-xs text-rose-700 dark:text-rose-300"><RefreshCw size={14} />{t('Processing status unavailable')}</span>
   if (!job) return <span role="status" className="text-xs text-[var(--muted-foreground)]">{t('Loading processing status…')}</span>
   const labels: Record<CourseJobStatus, string> = {
-    queued: t('Queued'),
+    queued: t('Queued — resume required'),
     source_processing: t('Processing sources'),
     awaiting_manifest_review: t('Manifest review required'),
     completed: t('Review complete'),
     failed: t('Processing failed'),
   }
-  return <span role="status" className="inline-flex items-center gap-1.5 text-xs text-[var(--muted-foreground)]">{job.status === 'completed' ? <CheckCircle2 size={14} /> : job.status !== 'failed' ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : null}{labels[job.status]}</span>
+  return <span role="status" className="inline-flex items-center gap-1.5 text-xs text-[var(--muted-foreground)]">{job.status === 'completed' ? <CheckCircle2 size={14} /> : job.status !== 'failed' && job.status !== 'queued' ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : null}{labels[job.status]}</span>
 }
 
 function ManifestReview({
   manifest,
   entries,
   blockers,
+  readOnly,
   saving,
   approving,
   onUpdate,
@@ -319,6 +392,7 @@ function ManifestReview({
   manifest: CourseManifest
   entries: ManifestEntry[]
   blockers: string[]
+  readOnly: boolean
   saving: boolean
   approving: boolean
   onUpdate: (id: string, patch: Partial<ManifestEntry>) => void
@@ -345,24 +419,24 @@ function ManifestReview({
             <p className="mt-1 break-all text-[11px] text-[var(--muted-foreground)]">{t('Original filename')}: {entry.original_filename}</p>
             <div className="mt-3 grid gap-3 sm:grid-cols-2">
               <label className="grid gap-1 text-xs font-medium text-[var(--foreground)]">{t('Role')}
-                <select value={entry.role} onChange={event => onUpdate(entry.id, { role: event.target.value as ManifestRole, role_confirmed: true })} className="h-9 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]">
+                <select value={entry.role} disabled={readOnly} onChange={event => onUpdate(entry.id, { role: event.target.value as ManifestRole, role_confirmed: true })} className="h-9 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-60">
                   {ROLES.map(role => <option key={role} value={role}>{roleLabel(role)}</option>)}
                 </select>
               </label>
               <label className="grid gap-1 text-xs font-medium text-[var(--foreground)]">{t('Visibility')}
-                <select value={entry.visibility} onChange={event => onUpdate(entry.id, { visibility: event.target.value as ManifestVisibility, visibility_confirmed: true })} className="h-9 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)]">
+                <select value={entry.visibility} disabled={readOnly} onChange={event => onUpdate(entry.id, { visibility: event.target.value as ManifestVisibility, visibility_confirmed: true })} className="h-9 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:cursor-not-allowed disabled:opacity-60">
                   {VISIBILITIES.map(visibility => <option key={visibility} value={visibility}>{visibilityLabel(visibility)}</option>)}
                 </select>
               </label>
             </div>
-            {entry.suspected_solution && <div className="mt-3 grid gap-2 text-xs text-[var(--muted-foreground)]"><label className="flex items-start gap-2"><input type="checkbox" checked={entry.role_confirmed} onChange={event => onUpdate(entry.id, { role_confirmed: event.target.checked })} className="mt-0.5" />{t('I confirm this role for a suspected solution.')}</label><label className="flex items-start gap-2"><input type="checkbox" checked={entry.visibility_confirmed} onChange={event => onUpdate(entry.id, { visibility_confirmed: event.target.checked })} className="mt-0.5" />{t('I confirm this visibility for a suspected solution.')}</label></div>}
+            {entry.suspected_solution && <div className="mt-3 grid gap-2 text-xs text-[var(--muted-foreground)]"><label className="flex items-start gap-2"><input type="checkbox" disabled={readOnly} checked={entry.role_confirmed} onChange={event => onUpdate(entry.id, { role_confirmed: event.target.checked })} className="mt-0.5" />{t('I confirm this role for a suspected solution.')}</label><label className="flex items-start gap-2"><input type="checkbox" disabled={readOnly} checked={entry.visibility_confirmed} onChange={event => onUpdate(entry.id, { visibility_confirmed: event.target.checked })} className="mt-0.5" />{t('I confirm this visibility for a suspected solution.')}</label></div>}
           </fieldset>
         ))}
       </div>
-      <div className="mt-5 flex flex-wrap items-center justify-end gap-3">
+      {!readOnly && <div className="mt-5 flex flex-wrap items-center justify-end gap-3">
         <button type="button" onClick={onSave} disabled={saving} className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] px-4 text-xs font-medium text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:opacity-50">{saving && <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />}{t('Save corrections')}</button>
         <button type="button" onClick={onApprove} disabled={approving || blockers.length > 0} className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:opacity-50">{approving && <Loader2 size={14} className="animate-spin motion-reduce:animate-none" />}{t('Approve manifest')}</button>
-      </div>
+      </div>}
       {manifest.eligible_for_planning && <div role="status" className="mt-4 flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-800 dark:text-emerald-200"><CheckCircle2 size={17} className="mt-0.5 shrink-0" /><span>{t('Ready for planning in OWE-8 / OWE-9. Course Mode does not generate a plan.')}</span></div>}
     </section>
   )
