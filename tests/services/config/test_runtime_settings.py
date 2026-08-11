@@ -18,6 +18,7 @@ RUNTIME_ENV_KEYS = (
     "CORS_ORIGINS",
     "DISABLE_SSL_VERIFY",
     "CHAT_ATTACHMENT_DIR",
+    "DEEPTUTOR_COURSE_MAX_PER_OWNER",
     "AUTH_ENABLED",
     "NEXT_PUBLIC_AUTH_ENABLED",
     "AUTH_USERNAME",
@@ -468,6 +469,25 @@ def test_chat_attachment_limits_env_overrides(tmp_path: Path) -> None:
     assert effective["chat_attachment_max_chars_total"] == 300_000
     # The file keeps the stored (default) values — env is a process override.
     assert _read_json(service.path_for("system"))["chat_attachment_max_file_mb"] == 20
+
+
+def test_course_limit_defaults_and_clamps(tmp_path: Path) -> None:
+    service = RuntimeSettingsService(tmp_path / "settings", process_env={})
+
+    assert service.load_system()["course_max_per_owner"] == 200
+    assert service.save_system({"course_max_per_owner": 0})["course_max_per_owner"] == 1
+    assert service.save_system({"course_max_per_owner": 100_000})["course_max_per_owner"] == 10_000
+
+
+def test_course_limit_process_override_is_not_persisted(tmp_path: Path) -> None:
+    service = RuntimeSettingsService(
+        tmp_path / "settings",
+        process_env={"DEEPTUTOR_COURSE_MAX_PER_OWNER": "25"},
+    )
+    service.save_system({})
+
+    assert service.load_system()["course_max_per_owner"] == 25
+    assert _read_json(service.path_for("system"))["course_max_per_owner"] == 200
 
 
 def test_compute_ws_max_size_floor_and_inflation() -> None:

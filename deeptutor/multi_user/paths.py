@@ -6,9 +6,9 @@ one tree to mount and back up:
 * ``data/user``           — the admin workspace (admin scope root is ``data/``)
 * ``data/users/<uid>``    — one workspace per non-admin user
 * ``data/partners/<id>``  — partner (synthetic-user) workspaces
-* ``data/system``         — deployment state: accounts, grants, audit, and the
-  per-owner secrets of :func:`get_owner_secrets_dir`. Never mounted into the
-  sandbox runner — see ``docker-compose.yml``.
+* ``data/system``         — deployment state: accounts, grants, audit, private
+  per-owner secrets, and tenant-isolated Course databases/workspaces. Never
+  mounted into the sandbox runner — see ``docker-compose.yml``.
 
 Deployments upgraded from the sibling ``multi-user/`` layout are migrated
 in place by :func:`migrate_legacy_multi_user_tree`.
@@ -17,6 +17,7 @@ in place by :func:`migrate_legacy_multi_user_tree`.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -137,11 +138,27 @@ def ensure_system_dirs() -> None:
     os.chmod(secrets_root, stat.S_IRWXU)
 
 
+def course_storage_root_for_scope(scope: UserScope) -> Path:
+    """Return a stable, non-client-controlled private Course root for *scope*.
+
+    The digest is derived only from the authenticated server-side scope kind
+    and user id. It remains stable when a deployment moves its data directory,
+    while avoiding any path interpretation of an identity string.
+    """
+    identity = f"{scope.kind}:{scope.user_id}".encode("utf-8")
+    storage_key = hashlib.sha256(identity).hexdigest()
+    return SYSTEM_ROOT / "course-mode" / "scopes" / storage_key
+
+
 def get_path_service_for_scope(scope: UserScope) -> PathService:
     key = scope.cache_key
     service = _path_services.get(key)
     if service is None:
-        service = PathService(workspace_root=scope.root)
+        service = PathService(
+            workspace_root=scope.root,
+            course_storage_root=course_storage_root_for_scope(scope),
+            course_storage_anchor=SYSTEM_ROOT.parent,
+        )
         _path_services[key] = service
     return service
 
@@ -150,13 +167,13 @@ def get_admin_path_service() -> PathService:
     return get_path_service_for_scope(admin_scope())
 
 
-def get_current_path_service() -> PathService:
+def _get_current_scoped_path_service(*, create_user_workspace: bool) -> PathService:
     from .context import get_current_user_or_none
 
     user = get_current_user_or_none()
     if user is None:
         return PathService.get_instance()
-    if user.scope.kind == "user":
+    if create_user_workspace and user.scope.kind == "user":
         ensure_scope_workspace(user.scope)
     return get_path_service_for_scope(user.scope)
 
@@ -248,6 +265,20 @@ def get_owner_secrets_dir() -> Path:
 def current_owner_id() -> str:
     """Id of the account owning the current scope (a partner's is its owner's)."""
     return _resolve_owner()[0]
+
+
+def get_current_path_service() -> PathService:
+    return _get_current_scoped_path_service(create_user_workspace=True)
+
+
+def get_current_course_path_service() -> PathService:
+    """Resolve Course storage without creating the runner-visible workspace.
+
+    Course routes use this dependency instead of :func:`get_current_path_service`.
+    Authentication already installed the current user, and Course data lives
+    solely under the server-private ``data/system`` tree.
+    """
+    return _get_current_scoped_path_service(create_user_workspace=False)
 
 
 @contextmanager

@@ -15,7 +15,7 @@ import {
   type SessionSummary,
 } from "@/lib/session-api";
 
-export default function WorkspaceSidebar() {
+export default function WorkspaceSidebar({ forceExpanded = false }: { forceExpanded?: boolean }) {
   const { t } = useTranslation();
   const router = useRouter();
   const {
@@ -125,6 +125,7 @@ export default function WorkspaceSidebar() {
 
   return (
     <SidebarShell
+      forceExpanded={forceExpanded}
       showSessions
       sessions={orderedSessions}
       activeSessionId={selectedSessionId}

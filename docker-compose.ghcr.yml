@@ -54,6 +54,8 @@ services:
       # writable layer — discarded on every recreate. Upgrading from that
       # layout needs a one-time copy out of the running container first; see
       # CONTAINERIZATION.md → "One-time migration".
+      # This one backupable tree also includes server-private Course data under
+      # data/system and per-user state under data/users.
       - ./data:/app/data
 
     healthcheck:

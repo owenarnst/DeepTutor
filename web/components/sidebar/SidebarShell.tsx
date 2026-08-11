@@ -12,6 +12,7 @@ import {
   Brain,
   ChevronDown,
   Github,
+  GraduationCap,
   HeartHandshake,
   House,
   LayoutGrid,
@@ -82,6 +83,12 @@ const PRIMARY_NAV: NavEntry[] = [
     requires: "llm",
   },
   {
+    href: "/courses",
+    label: "Courses",
+    icon: GraduationCap,
+    tooltipKey: "Courses tooltip",
+  },
+  {
     href: "/space",
     label: "Learning Space",
     icon: LayoutGrid,
@@ -115,6 +122,7 @@ const DOCS_URL = "https://deeptutor.info/";
 const RECENTS_COLLAPSED_KEY = "deeptutor.sidebar.recentsCollapsed";
 
 interface SidebarShellProps {
+  forceExpanded?: boolean;
   sessions?: SessionSummary[];
   activeSessionId?: string | null;
   loadingSessions?: boolean;
@@ -133,6 +141,7 @@ interface SidebarShellProps {
 }
 
 export function SidebarShell({
+  forceExpanded = false,
   sessions = [],
   activeSessionId = null,
   loadingSessions = false,
@@ -154,7 +163,7 @@ export function SidebarShell({
   // Inside the mobile drawer the icon-only rail is pointless — the panel is
   // already hidden when you don't want it, so it always opens fully expanded
   // regardless of the persisted desktop preference.
-  const collapsed = sidebarCollapsed && !isMobile;
+  const collapsed = forceExpanded ? false : sidebarCollapsed && !isMobile;
 
   /** Dismiss the drawer on nav clicks that actually navigate in-place. */
   const closeDrawerOnNav = (event: React.MouseEvent) => {
@@ -359,13 +368,15 @@ export function SidebarShell({
         </Link>
         {/* The rail is a desktop affordance; in the drawer the scrim and the
             top-bar toggle already own "make this go away". */}
-        <button
-          onClick={() => setCollapsed(true)}
-          className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] max-md:hidden"
-          aria-label={t("Collapse sidebar")}
-        >
-          <PanelLeftClose size={15} />
-        </button>
+        {!forceExpanded && (
+          <button
+            onClick={() => setCollapsed(true)}
+            className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] max-md:hidden"
+            aria-label={t("Collapse sidebar")}
+          >
+            <PanelLeftClose size={15} />
+          </button>
+        )}
       </div>
 
       {/* Primary nav */}

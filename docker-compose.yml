@@ -133,6 +133,8 @@ services:
     # place, data/cli-apps, rather than in either: the runner has to *execute*
     # them, so data/system is out; it must not be able to *modify* them, so a
     # workspace subtree is out too.
+    # Course databases and Course artifact workspaces also live under data/system,
+    # so neither is present in this untrusted container.
     volumes:
       - ./data/user/workspace:/app/data/user/workspace
       - ./data/users:/app/data/users
