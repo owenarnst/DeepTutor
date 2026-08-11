@@ -43,6 +43,34 @@ def _auth(user: str = "alice") -> dict[str, str]:
     return {"Authorization": f"Bearer {user}-token"}
 
 
+def _create_course(
+    client: TestClient,
+    *,
+    title: str,
+    key: str,
+    actor: str = "alice",
+    content: bytes = b"Cell biology lecture notes\nMitochondria produce ATP.",
+    filename: str = "lecture-notes.txt",
+    **overrides: object,
+):
+    """Submit the ratified multipart Course import contract."""
+    data: dict[str, str] = {
+        "title": title,
+        "description": "Learn the cell",
+        "unit_title": "The cell",
+        "desired_outcome": "Explain the core concepts and solve representative problems.",
+        "weekly_minutes": "120",
+        "ocw_url": "https://ocw.mit.edu/courses/7-01sc-fundamentals-of-biology-fall-2011/",
+    }
+    data.update({name: str(value) for name, value in overrides.items()})
+    return client.post(
+        "/api/v1/courses",
+        headers={**_auth(actor), "Idempotency-Key": key},
+        data=data,
+        files={"files": (filename, content, "text/plain")},
+    )
+
+
 def _plant_runner_visible_course_storage(
     data_root: Path,
     *,
@@ -80,15 +108,10 @@ def _plant_runner_visible_course_storage(
 
 
 def test_create_list_and_reopen_draft(course_client: TestClient) -> None:
-    headers = {**_auth(), "Idempotency-Key": "browser-attempt-1"}
-    response = course_client.post(
-        "/api/v1/courses",
-        headers=headers,
-        json={
-            "title": "Cell Biology",
-            "description": "Learn the cell",
-            "unit_title": "The cell",
-        },
+    response = _create_course(
+        course_client,
+        title="Cell Biology",
+        key="browser-attempt-1",
     )
 
     assert response.status_code == 201
@@ -97,17 +120,15 @@ def test_create_list_and_reopen_draft(course_client: TestClient) -> None:
     assert len(course["units"]) == 1
     assert course["units"][0]["course_id"] == course["id"]
 
-    replay = course_client.post(
-        "/api/v1/courses",
-        headers=headers,
-        json={
-            "title": " Cell   Biology ",
-            "description": "Learn the cell",
-            "unit_title": "The cell",
-        },
+    replay = _create_course(
+        course_client,
+        title=" Cell   Biology ",
+        key="browser-attempt-1",
     )
     assert replay.status_code == 200
-    assert replay.json() == {"course": course, "created": False}
+    assert replay.json()["course"] == course
+    assert replay.json()["created"] is False
+    assert replay.json()["processing_job"] == response.json()["processing_job"]
 
     listed = course_client.get("/api/v1/courses", headers=_auth())
     assert listed.status_code == 200
@@ -134,10 +155,11 @@ def test_actual_course_route_uses_server_private_storage_without_user_workspace_
 
     created: dict[str, dict] = {}
     for actor in ("alice", "bob", "admin"):
-        response = course_client.post(
-            "/api/v1/courses",
-            headers={**_auth(actor), "Idempotency-Key": f"private-storage-{actor}"},
-            json={"title": f"{actor.title()} private course"},
+        response = _create_course(
+            course_client,
+            actor=actor,
+            key=f"private-storage-{actor}",
+            title=f"{actor.title()} private course",
         )
         assert response.status_code == 201
         created[actor] = response.json()["course"]
@@ -211,10 +233,11 @@ def test_actual_course_route_ignores_runner_visible_course_storage(
             == 404
         )
 
-        response = course_client.post(
-            "/api/v1/courses",
-            headers={**_auth(actor), "Idempotency-Key": f"private-{actor}"},
-            json={"title": f"Private {actor} course"},
+        response = _create_course(
+            course_client,
+            actor=actor,
+            key=f"private-{actor}",
+            title=f"Private {actor} course",
         )
         assert response.status_code == 201
         created[actor] = response.json()["course"]
@@ -257,21 +280,34 @@ def test_create_requires_auth_and_a_stable_request_key(course_client: TestClient
 def test_create_rejects_client_ownership_and_key_reuse_conflict(
     course_client: TestClient,
 ) -> None:
-    headers = {**_auth(), "Idempotency-Key": "ownership-test"}
     client_owned = course_client.post(
         "/api/v1/courses",
-        headers=headers,
-        json={"title": "Physics", "user_id": "u_bob"},
+        headers={**_auth(), "Idempotency-Key": "ownership-test"},
+        data={
+            "title": "Physics",
+            "unit_title": "Unit",
+            "desired_outcome": "Outcome",
+            "weekly_minutes": "60",
+            "ocw_url": "https://ocw.mit.edu/courses/7-01sc-fundamentals-of-biology-fall-2011/",
+            "user_id": "u_bob",
+        },
+        files={"files": ("notes.txt", b"notes", "text/plain")},
     )
     assert client_owned.status_code == 422
 
     assert (
-        course_client.post(
-            "/api/v1/courses", headers=headers, json={"title": "Physics"}
+        _create_course(
+            course_client,
+            key="ownership-test",
+            title="Physics",
         ).status_code
         == 201
     )
-    conflict = course_client.post("/api/v1/courses", headers=headers, json={"title": "Chemistry"})
+    conflict = _create_course(
+        course_client,
+        key="ownership-test",
+        title="Chemistry",
+    )
     assert conflict.status_code == 409
     assert conflict.json()["detail"] == (
         "Idempotency key was already used with different course input"
@@ -279,10 +315,11 @@ def test_create_rejects_client_ownership_and_key_reuse_conflict(
 
 
 def test_missing_foreign_and_traversal_ids_do_not_leak(course_client: TestClient) -> None:
-    created = course_client.post(
-        "/api/v1/courses",
-        headers={**_auth("alice"), "Idempotency-Key": "alice-course"},
-        json={"title": "Alice only"},
+    created = _create_course(
+        course_client,
+        actor="alice",
+        key="alice-course",
+        title="Alice only",
     ).json()["course"]
 
     assert (
@@ -309,10 +346,10 @@ def test_missing_foreign_and_traversal_ids_do_not_leak(course_client: TestClient
 
 def test_course_list_is_paginated_and_bounded(course_client: TestClient) -> None:
     for index in range(3):
-        response = course_client.post(
-            "/api/v1/courses",
-            headers={**_auth(), "Idempotency-Key": f"page-{index}"},
-            json={"title": f"Course {index}"},
+        response = _create_course(
+            course_client,
+            key=f"page-{index}",
+            title=f"Course {index}",
         )
         assert response.status_code == 201
 
@@ -341,24 +378,24 @@ def test_quota_rejects_new_course_but_allows_replay_at_limit(
         lambda: {"course_max_per_owner": 2},
     )
     first_headers = {**_auth(), "Idempotency-Key": "quota-first"}
-    first = course_client.post("/api/v1/courses", headers=first_headers, json={"title": "First"})
-    second = course_client.post(
-        "/api/v1/courses",
-        headers={**_auth(), "Idempotency-Key": "quota-second"},
-        json={"title": "Second"},
+    first = _create_course(course_client, key="quota-first", title="First")
+    second = _create_course(
+        course_client,
+        key="quota-second",
+        title="Second",
     )
     assert first.status_code == 201
     assert second.status_code == 201
 
-    exhausted = course_client.post(
-        "/api/v1/courses",
-        headers={**_auth(), "Idempotency-Key": "quota-third"},
-        json={"title": "Third"},
+    exhausted = _create_course(
+        course_client,
+        key="quota-third",
+        title="Third",
     )
     assert exhausted.status_code == 409
     assert exhausted.json()["detail"] == "Course limit reached (2 per owner)"
 
-    replay = course_client.post("/api/v1/courses", headers=first_headers, json={"title": "First"})
+    replay = _create_course(course_client, key="quota-first", title="First")
     assert replay.status_code == 200
     assert replay.json()["created"] is False
     assert replay.json()["course"]["id"] == first.json()["course"]["id"]
@@ -393,3 +430,109 @@ async def test_list_moves_blocking_repository_work_off_event_loop(monkeypatch) -
 
     assert response.courses == []
     assert order == ["heartbeat", "repository-finished"]
+
+
+def test_import_exposes_durable_processing_and_manifest_review(course_client: TestClient) -> None:
+    response = _create_course(
+        course_client,
+        key="import-contract",
+        title="Import contract",
+        filename="week-1-solution.md",
+        content=b"Answer key content",
+    )
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["course"]["ocw_url"].startswith("https://ocw.mit.edu/courses/")
+    job = payload["processing_job"]
+    assert job["status"] == "awaiting_manifest_review"
+    assert job["stage"] == "awaiting_manifest_review"
+
+    fetched_job = course_client.get(f"/api/v1/courses/jobs/{job['id']}", headers=_auth())
+    assert fetched_job.status_code == 200
+    assert fetched_job.json()["job"]["id"] == job["id"]
+
+    manifest_response = course_client.get(
+        f"/api/v1/courses/{payload['course']['id']}/manifest", headers=_auth()
+    )
+    assert manifest_response.status_code == 200
+    manifest = manifest_response.json()
+    assert len(manifest["entries"]) == 1
+    assert manifest["entries"][0]["role"] == "solution"
+    assert manifest["entries"][0]["visibility"] == "instructor_only"
+    assert manifest["blockers"] == ["suspected_solution_confirmation"]
+
+    blocked = course_client.post(
+        f"/api/v1/courses/{payload['course']['id']}/manifest/approve",
+        headers=_auth(),
+        json={"revision": manifest["revision"]},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "manifest_review_incomplete"
+
+    entry = manifest["entries"][0]
+    corrected = course_client.patch(
+        f"/api/v1/courses/{payload['course']['id']}/manifest",
+        headers=_auth(),
+        json={
+            "revision": manifest["revision"],
+            "entries": [
+                {
+                    "id": entry["id"],
+                    "role": "solution",
+                    "visibility": "instructor_only",
+                    "role_confirmed": True,
+                    "visibility_confirmed": True,
+                }
+            ],
+        },
+    )
+    assert corrected.status_code == 200
+    assert corrected.json()["blockers"] == []
+
+    approved = course_client.post(
+        f"/api/v1/courses/{payload['course']['id']}/manifest/approve",
+        headers=_auth(),
+        json={"revision": corrected.json()["revision"]},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["eligible_for_planning"] is True
+    assert approved.json()["course_id"] == payload["course"]["id"]
+
+
+def test_import_rejects_source_less_json_and_unsafe_or_unsupported_uploads(
+    course_client: TestClient,
+) -> None:
+    source_less = course_client.post(
+        "/api/v1/courses",
+        headers={**_auth(), "Idempotency-Key": "source-less"},
+        json={"title": "No source"},
+    )
+    assert source_less.status_code == 422
+    assert source_less.json()["detail"] == (
+        "Course creation requires at least one uploaded source file"
+    )
+
+    common = {
+        "title": "Unsafe source",
+        "unit_title": "Unit 1",
+        "desired_outcome": "Read the source",
+        "weekly_minutes": "30",
+        "ocw_url": "https://ocw.mit.edu/courses/18-06/",
+    }
+    traversal = course_client.post(
+        "/api/v1/courses",
+        headers={**_auth(), "Idempotency-Key": "traversal-source"},
+        data=common,
+        files={"files": ("../notes.md", b"notes", "text/markdown")},
+    )
+    assert traversal.status_code == 422
+    assert "relative basename" in traversal.json()["detail"]
+
+    image = course_client.post(
+        "/api/v1/courses",
+        headers={**_auth(), "Idempotency-Key": "image-source"},
+        data=common,
+        files={"files": ("diagram.svg", b"<svg></svg>", "image/svg+xml")},
+    )
+    assert image.status_code == 422
+    assert "Unsupported Course source format" in image.json()["detail"]

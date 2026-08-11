@@ -10,6 +10,13 @@ const course = {
   workspace_ref: `courses/${COURSE_ID}`,
   created_at: '2026-08-06T12:00:00Z',
   updated_at: '2026-08-06T12:00:00Z',
+  desired_outcome: 'Explain how cells are organized.',
+  weekly_minutes: 120,
+  ocw_url: 'https://ocw.mit.edu/courses/7-01sc-fundamentals-of-biology-fall-2011/',
+  scheduling: null,
+  difficulty: null,
+  accessibility: null,
+  processing_job_id: '33333333-3333-4333-8333-333333333333',
   units: [
     {
       id: '22222222-2222-4222-8222-222222222222',
@@ -18,6 +25,42 @@ const course = {
       position: 0,
     },
   ],
+}
+
+const processingJob = {
+  id: '33333333-3333-4333-8333-333333333333',
+  course_id: COURSE_ID,
+  status: 'awaiting_manifest_review',
+  stage: 'awaiting_manifest_review',
+  failed_stage: null,
+  error_code: null,
+  attempt_count: 1,
+  manifest_revision: 1,
+  created_at: '2026-08-06T12:00:00Z',
+  updated_at: '2026-08-06T12:00:00Z',
+}
+
+const manifest = {
+  course_id: COURSE_ID,
+  revision: 1,
+  entries: [
+    {
+      id: '44444444-4444-4444-8444-444444444444',
+      course_id: COURSE_ID,
+      source_id: '55555555-5555-4555-8555-555555555555',
+      original_filename: 'lecture-notes.txt',
+      display_filename: 'lecture-notes.txt',
+      role: 'lecture_note',
+      visibility: 'learner_visible',
+      suspected_solution: false,
+      role_confirmed: true,
+      visibility_confirmed: true,
+      created_at: '2026-08-06T12:00:00Z',
+      updated_at: '2026-08-06T12:00:00Z',
+    },
+  ],
+  blockers: [],
+  eligible_for_planning: true,
 }
 
 function observeUnexpectedConsole(page: Page): string[] {
@@ -48,6 +91,14 @@ async function mockCourseApi(page: Page, listedCourses = [course]) {
   await page.route('**/api/v1/courses**', async route => {
     const request = route.request()
     const { pathname } = new URL(request.url())
+    if (request.method() === 'GET' && pathname.endsWith('/processing')) {
+      await route.fulfill({ json: { job: processingJob } })
+      return
+    }
+    if (request.method() === 'GET' && pathname.endsWith('/manifest')) {
+      await route.fulfill({ json: manifest })
+      return
+    }
     if (request.method() === 'GET' && pathname.endsWith(`/${COURSE_ID}`)) {
       await route.fulfill({ json: { course } })
       return
@@ -84,6 +135,15 @@ test.describe('Course Mode workflow', () => {
     const offsets: string[] = []
     await mockWorkspaceShellApi(page)
     await page.route('**/api/v1/courses**', async route => {
+      const { pathname } = new URL(route.request().url())
+      if (route.request().method() === 'GET' && pathname.endsWith('/processing')) {
+        await route.fulfill({ json: { job: processingJob } })
+        return
+      }
+      if (route.request().method() === 'GET' && pathname.endsWith('/manifest')) {
+        await route.fulfill({ json: manifest })
+        return
+      }
       const url = new URL(route.request().url())
       const requestedCourse = allCourses.find(item => url.pathname.endsWith(`/${item.id}`))
       if (requestedCourse) {
@@ -143,8 +203,16 @@ test.describe('Course Mode workflow', () => {
             body: JSON.stringify({ detail: 'Response lost; retry safely.' }),
           })
         } else {
-          await route.fulfill({ status: 200, json: { course, created: false } })
+          await route.fulfill({ status: 200, json: { course, created: false, processing_job: processingJob } })
         }
+        return
+      }
+      if (request.method() === 'GET' && pathname.endsWith('/processing')) {
+        await route.fulfill({ json: { job: processingJob } })
+        return
+      }
+      if (request.method() === 'GET' && pathname.endsWith('/manifest')) {
+        await route.fulfill({ json: manifest })
         return
       }
       if (request.method() === 'GET' && pathname.endsWith(`/${COURSE_ID}`)) {
@@ -165,14 +233,21 @@ test.describe('Course Mode workflow', () => {
     )
     await page.getByLabel('Course title').fill('Cell Biology')
     await page.getByLabel('First unit').fill('The cell')
-    await page.getByLabel('Description').fill('Learn how cells are organized.')
+    await page.getByLabel('Course description').fill('Learn how cells are organized.')
+    await page.getByLabel('Desired outcome').fill('Explain how cells are organized.')
+    await page.getByLabel('MIT OpenCourseWare URL').fill(course.ocw_url)
+    await page.getByLabel('Source files').setInputFiles({
+      name: 'lecture-notes.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from('Cell biology lecture notes'),
+    })
 
-    await page.getByRole('button', { name: 'Create draft' }).click()
+    await page.getByRole('button', { name: 'Import course' }).click()
     await expect(page.getByText('Response lost; retry safely.')).toBeVisible()
     // A simulated 504 is expected to produce one browser resource error. The
     // successful retry and reopened workspace must remain console-clean.
     unexpectedConsole.length = 0
-    await page.getByRole('button', { name: 'Create draft' }).click()
+    await page.getByRole('button', { name: 'Import course' }).click()
 
     await expect(page).toHaveURL(new RegExp(`/courses/${COURSE_ID}$`))
     await expect(page.getByRole('heading', { level: 1, name: course.title })).toBeVisible()

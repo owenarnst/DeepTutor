@@ -30,6 +30,13 @@ function normalizedFingerprint(input: CreateCourseInput): string {
     title: normalize(input.title),
     description: normalize(input.description),
     unit_title: normalize(input.unit_title || 'Unit 1'),
+    desired_outcome: normalize(input.desired_outcome),
+    weekly_minutes: input.weekly_minutes,
+    ocw_url: normalize(input.ocw_url),
+    scheduling: normalize(input.scheduling),
+    difficulty: normalize(input.difficulty),
+    accessibility: normalize(input.accessibility),
+    files: (input.files || []).map(file => `${file.name}:${file.size}:${file.lastModified}`),
   })
 }
 
@@ -47,8 +54,16 @@ export default function CoursesPage() {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [unitTitle, setUnitTitle] = useState('Unit 1')
+  const [desiredOutcome, setDesiredOutcome] = useState('')
+  const [weeklyMinutes, setWeeklyMinutes] = useState('120')
+  const [ocwUrl, setOcwUrl] = useState('https://ocw.mit.edu/courses/')
+  const [scheduling, setScheduling] = useState('')
+  const [difficulty, setDifficulty] = useState('')
+  const [accessibility, setAccessibility] = useState('')
+  const [fileNames, setFileNames] = useState<string[]>([])
   const pendingRequest = useRef<PendingRequest | null>(null)
   const titleInputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     let active = true
@@ -105,6 +120,17 @@ export default function CoursesPage() {
       title,
       description,
       unit_title: unitTitle,
+      desired_outcome: desiredOutcome,
+      weekly_minutes: Number(weeklyMinutes),
+      ocw_url: ocwUrl,
+      scheduling,
+      difficulty,
+      accessibility,
+      files: fileInputRef.current ? Array.from(fileInputRef.current.files || []) : [],
+    }
+    if (!input.files?.length) {
+      setError(t('Add at least one supported text-extractable source file.'))
+      return
     }
     const fingerprint = normalizedFingerprint(input)
     const existing = pendingRequest.current
@@ -173,7 +199,7 @@ export default function CoursesPage() {
                 {t('Create a draft course')}
               </h2>
               <p className="mt-1 text-xs text-[var(--muted-foreground)]">
-                {t('Start with one unit. You can shape the course in later steps.')}
+                {t('Import text-bearing OCW materials for a private manifest review.')}
               </p>
             </div>
             <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
@@ -200,19 +226,95 @@ export default function CoursesPage() {
                 />
               </label>
               <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
-                {t('Description')}
+                {t('Desired outcome')}
+                <textarea
+                  required
+                  maxLength={2000}
+                  value={desiredOutcome}
+                  onChange={event => setDesiredOutcome(event.target.value)}
+                  className="min-h-20 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30"
+                  placeholder={t('What should you be able to do?')}
+                />
+              </label>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
+                {t('Course description')}
                 <input
                   maxLength={2000}
                   value={description}
                   onChange={event => setDescription(event.target.value)}
                   className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30"
-                  placeholder={t('What do you want to learn?')}
+                  placeholder={t('Optional context for this course')}
                 />
+              </label>
+              <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
+                {t('Weekly minutes')}
+                <input
+                  required
+                  type="number"
+                  min={1}
+                  max={10080}
+                  step={1}
+                  value={weeklyMinutes}
+                  onChange={event => setWeeklyMinutes(event.target.value)}
+                  className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30"
+                />
+              </label>
+            </div>
+            <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
+              {t('MIT OpenCourseWare URL')}
+              <input
+                required
+                type="url"
+                value={ocwUrl}
+                onChange={event => setOcwUrl(event.target.value)}
+                pattern="https://ocw\.mit\.edu/courses/.+"
+                className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30"
+                aria-describedby="ocw-url-help"
+              />
+              <span id="ocw-url-help" className="text-[11px] font-normal text-[var(--muted-foreground)]">
+                {t('Saved for learner context only; DeepTutor never fetches this URL.')}
+              </span>
+            </label>
+            <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
+              {t('Source files')}
+              <input
+                ref={fileInputRef}
+                required
+                type="file"
+                multiple
+                accept=".pdf,.docx,.xlsx,.pptx,.txt,.md,.markdown,.rst,.csv,.json,.yaml,.yml,.tex,.html,.xml"
+                onChange={event => setFileNames(Array.from(event.target.files || []).map(file => file.name))}
+                className="block w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm file:mr-3 file:rounded file:border-0 file:bg-[var(--secondary)] file:px-2 file:py-1 file:text-xs"
+                aria-describedby="source-files-help"
+              />
+              <span id="source-files-help" className="text-[11px] font-normal text-[var(--muted-foreground)]">
+                {t('Supported: PDF, DOCX, XLSX, PPTX, and text or Markdown files. Images, media, archives, and empty files are rejected.')}
+              </span>
+              {fileNames.length > 0 && (
+                <span role="status" className="text-[11px] font-normal text-[var(--foreground)]">
+                  {t('{{count}} file(s) selected', { count: fileNames.length })}: {fileNames.join(', ')}
+                </span>
+              )}
+            </label>
+            <div className="grid gap-4 sm:grid-cols-3">
+              <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
+                {t('Scheduling (optional)')}
+                <input value={scheduling} onChange={event => setScheduling(event.target.value)} className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30" />
+              </label>
+              <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
+                {t('Difficulty (optional)')}
+                <input value={difficulty} onChange={event => setDifficulty(event.target.value)} className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30" />
+              </label>
+              <label className="grid gap-1.5 text-xs font-medium text-[var(--foreground)]">
+                {t('Accessibility (optional)')}
+                <input value={accessibility} onChange={event => setAccessibility(event.target.value)} className="h-10 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 text-sm outline-none focus-visible:border-[var(--primary)] focus-visible:ring-2 focus-visible:ring-[var(--primary)]/30" />
               </label>
             </div>
             <div className="flex items-center justify-between gap-4">
               <p className="text-xs text-[var(--muted-foreground)]">
-                {t('A failed network request can be retried safely.')}
+                {t('Imports are private to this course. A failed request can be retried safely.')}
               </p>
               <button
                 type="submit"
@@ -220,7 +322,7 @@ export default function CoursesPage() {
                 className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--foreground)] px-4 text-xs font-medium text-[var(--background)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] focus-visible:ring-offset-2 disabled:opacity-50"
               >
                 {creating && <Loader2 size={14} className="animate-spin" />}
-                {t('Create draft')}
+                {t('Import course')}
               </button>
             </div>
           </form>

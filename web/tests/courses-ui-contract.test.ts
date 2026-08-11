@@ -36,3 +36,13 @@ test('create form retains a stable request key for the same manual retry', () =>
   assert.match(gallery, /existing\?\.fingerprint\s*===\s*fingerprint/)
   assert.match(gallery, /existing\.requestKey\s*:\s*crypto\.randomUUID\(\)/)
 })
+
+test('Course import UI captures the source contract and review workflow', () => {
+  assert.match(gallery, /Desired outcome/)
+  assert.match(gallery, /weekly_minutes/)
+  assert.match(gallery, /ocw_url/)
+  assert.match(gallery, /setInputFiles|Source files/)
+  assert.match(detail, /Source manifest review/)
+  assert.match(detail, /Approve manifest/)
+  assert.match(detail, /Retry stage/)
+})

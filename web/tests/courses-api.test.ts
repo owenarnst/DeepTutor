@@ -36,13 +36,23 @@ test("create sends the caller's stable idempotency key without ownership", async
     title: 'Topology',
     description: 'Open sets',
     unit_title: 'Unit 1',
+    desired_outcome: 'Classify open and closed sets.',
+    weekly_minutes: 90,
+    ocw_url: 'https://ocw.mit.edu/courses/18-06sc-linear-algebra-fall-2011/',
+    files: [new File(['lecture notes'], 'notes.txt', { type: 'text/plain' })],
   }
   const restore = stubFetch((input, init) => {
     assert.equal(String(input), '/api/v1/courses')
     assert.equal(init?.method, 'POST')
     assert.equal(new Headers(init?.headers).get('Idempotency-Key'), 'browser-request-1')
-    assert.deepEqual(JSON.parse(String(init?.body)), payload)
-    assert.equal('user_id' in JSON.parse(String(init?.body)), false)
+    assert.equal(init?.body instanceof FormData, true)
+    const body = init?.body as FormData
+    assert.equal(body.get('title'), payload.title)
+    assert.equal(body.get('desired_outcome'), payload.desired_outcome)
+    assert.equal(body.get('weekly_minutes'), String(payload.weekly_minutes))
+    assert.equal(body.get('ocw_url'), payload.ocw_url)
+    assert.equal((body.get('files') as File).name, 'notes.txt')
+    assert.equal(body.get('user_id'), null)
     return Response.json({ course: sampleCourse, created: true }, { status: 201 })
   })
   try {
@@ -92,7 +102,17 @@ test("transport surfaces the backend's safe conflict detail", async () => {
   )
   try {
     await assert.rejects(
-      coursesApi.create({ title: 'Changed' }, 'browser-request-1'),
+      coursesApi.create(
+        {
+          title: 'Changed',
+          unit_title: 'Unit 1',
+          desired_outcome: 'A different outcome.',
+          weekly_minutes: 90,
+          ocw_url: 'https://ocw.mit.edu/courses/18-06sc-linear-algebra-fall-2011/',
+          files: [new File(['changed notes'], 'notes.txt', { type: 'text/plain' })],
+        },
+        'browser-request-1'
+      ),
       /already used with different course input/
     )
   } finally {
