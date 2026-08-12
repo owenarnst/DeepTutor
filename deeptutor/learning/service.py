@@ -5,8 +5,7 @@ import time
 from typing import TYPE_CHECKING
 import uuid
 
-from deeptutor.learning.grading import classify_error, grade_answer
-from deeptutor.learning.mastery import compute_mastery
+from deeptutor.learning.mastery_adapter import MasteryLearningAdapter
 from deeptutor.learning.models import (
     ErrorRecord,
     LearningModule,
@@ -23,8 +22,14 @@ if TYPE_CHECKING:
 
 
 class LearningService:
-    def __init__(self, store: LearningStore | None = None) -> None:
+    def __init__(
+        self,
+        store: LearningStore | None = None,
+        *,
+        adapter: MasteryLearningAdapter | None = None,
+    ) -> None:
         self._store = store or LearningStore()
+        self._adapter = adapter or MasteryLearningAdapter()
 
     def get_or_create(self, book_id: str) -> LearningProgress:
         existing = self._store.load(book_id)
@@ -152,7 +157,7 @@ class LearningService:
         correctness = [
             a.is_correct for a in progress.quiz_attempts if a.knowledge_point_id == kp_id
         ]
-        return compute_mastery(correctness)
+        return self._adapter.compute_mastery(correctness)
 
     def update_mastery(self, progress: LearningProgress, kp_id: str, level: float) -> None:
         progress.mastery_levels[kp_id] = level
@@ -179,7 +184,7 @@ class LearningService:
         interactive stage. Grading is fail-closed: with no stored expected
         answer the attempt is recorded wrong, never right.
         """
-        is_correct = bool(expected_answer) and grade_answer(
+        is_correct = bool(expected_answer) and self._adapter.grade_answer(
             user_answer, expected_answer, question_type
         )
         self.record_quiz_attempt(
@@ -191,7 +196,7 @@ class LearningService:
                 is_correct=is_correct,
                 user_answer=user_answer,
                 self_attribution=self_attribution,
-                error_type=None if is_correct else classify_error(user_answer),
+                error_type=None if is_correct else self._adapter.classify_error(user_answer),
             ),
         )
         if knowledge_point_id:
@@ -236,12 +241,7 @@ class LearningService:
         The boolean is the gate of record; ``mastery_levels`` is nudged only so
         the map's colour matches the gate (full on pass, capped on fail).
         """
-        progress.qualitative_mastery[kp_id] = bool(passed)
-        current = progress.mastery_levels.get(kp_id, 0.0)
-        progress.mastery_levels[kp_id] = max(current, 1.0) if passed else min(current, 0.4)
-        if evidence:
-            progress.feynman_explanations[kp_id] = evidence
-        progress.updated_at = time.time()
+        self._adapter.record_qualitative(progress, kp_id, passed=passed, evidence=evidence)
         self.save(progress)
 
     def list_progress(self) -> dict:
