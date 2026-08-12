@@ -153,14 +153,31 @@ class MasteryLearningAdapter:
         )
 
     def due_reviews(self, now: float | None = None) -> tuple[ReviewItem, ...]:
+        return tuple(item for item, _task in self.due_review_pairs(now=now))
+
+    def due_review_pairs(
+        self,
+        *,
+        now: float | None = None,
+        max_tasks: int | None = None,
+    ) -> tuple[tuple[ReviewItem, ReviewTask], ...]:
+        """Return ordered neutral decisions with their original task objects.
+
+        Review IDs were never validated as unique in historical JSON.  Keep
+        the association beside each DTO through filtering and stable sorting;
+        mapping by ``task.id`` would collapse distinct legacy queue entries.
+        """
+
         progress = self._require_progress()
         moment = time.time() if now is None else now
-        due: list[ReviewItem] = []
-        for task in progress.review_queue:
-            if task.due_at > moment:
-                continue
-            due.append(self._review_item(task, is_due=True))
-        due.sort(key=lambda item: item.priority)
+        due = [
+            (self._review_item(task, is_due=True), task)
+            for task in progress.review_queue
+            if task.due_at <= moment
+        ]
+        due.sort(key=lambda pair: pair[0].priority)
+        if max_tasks is not None:
+            due = due[:max_tasks]
         return tuple(due)
 
     def next_action(self, now: float | None = None) -> NextActionDecision:
@@ -499,17 +516,10 @@ class MasteryLearningAdapter:
         ]
 
     def get_due_tasks(self, progress: LearningProgress, max_tasks: int = 5) -> list[ReviewTask]:
-        moment = time.time()
-        due = [
-            self._review_item(task, is_due=True)
-            for task in progress.review_queue
-            if task.due_at <= moment
-        ]
-        due.sort(key=lambda item: item.priority)
-        queued_by_id = {task.id: task for task in progress.review_queue}
+        adapter = MasteryLearningAdapter(progress)
         return [
-            self.to_product_task(item, existing=queued_by_id.get(item.item_id))
-            for item in due[:max_tasks]
+            adapter.to_product_task(item, existing=task)
+            for item, task in adapter.due_review_pairs(max_tasks=max_tasks)
         ]
 
     # ── Product grading/scoring façade ───────────────────────────────────

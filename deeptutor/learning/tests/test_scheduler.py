@@ -223,6 +223,41 @@ class TestGetDueTasks:
         due = scheduler.get_due_tasks(lp, max_tasks=3)
         assert len(due) == 3
 
+    def test_duplicate_ids_preserve_sorted_original_tasks_and_states(self, scheduler):
+        now = time.time()
+        state_one = RepetitionState(next_review_at=now - 20, interval_index=1)
+        state_two = RepetitionState(next_review_at=now - 10, interval_index=2)
+        task_one = ReviewTask(
+            id="duplicate",
+            knowledge_point_id="kp-one",
+            knowledge_type=KnowledgeType.MEMORY,
+            due_at=now - 20,
+            priority=4,
+            state=state_one,
+        )
+        task_two = ReviewTask(
+            id="duplicate",
+            knowledge_point_id="kp-two",
+            knowledge_type=KnowledgeType.DESIGN,
+            due_at=now - 10,
+            priority=1,
+            state=state_two,
+        )
+        progress = LearningProgress(book_id="b1", review_queue=[task_one, task_two])
+
+        due = scheduler.get_due_tasks(progress)
+        assert [task.knowledge_point_id for task in due] == ["kp-two", "kp-one"]
+        assert due[0] is task_two
+        assert due[1] is task_one
+        assert due[0].state is state_two
+        assert due[1].state is state_one
+
+        reopened = LearningProgress.model_validate_json(progress.model_dump_json())
+        reopened_due = scheduler.get_due_tasks(reopened)
+        assert [task.knowledge_point_id for task in reopened_due] == ["kp-two", "kp-one"]
+        assert reopened_due[0] is reopened.review_queue[1]
+        assert reopened_due[1] is reopened.review_queue[0]
+
 
 # ── build_review_queue ───────────────────────────────────────────────────
 

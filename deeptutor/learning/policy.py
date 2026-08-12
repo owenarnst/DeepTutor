@@ -68,10 +68,9 @@ def due_reviews(progress: LearningProgress, *, now: float | None = None) -> list
     """Spaced-repetition tasks whose ``due_at`` has passed, highest priority
     first. Pure read over ``progress.review_queue`` (built by the scheduler)."""
     adapter = get_mastery_adapter(progress)
-    queued_by_id = {task.id: task for task in progress.review_queue}
     return [
-        adapter.to_product_task(item, existing=queued_by_id.get(item.item_id))
-        for item in adapter.due_reviews(now)
+        adapter.to_product_task(item, existing=task)
+        for item, task in adapter.due_review_pairs(now=now)
     ]
 
 
