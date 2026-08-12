@@ -143,7 +143,9 @@ class _CourseKernel:
         return self._evidence.get(objective_id, ())
 
     def progression_decision(self, objective_id: str) -> ProgressionDecision:
-        state = next(item for item in self._objectives if item.identity.objective_id == objective_id)
+        state = next(
+            item for item in self._objectives if item.identity.objective_id == objective_id
+        )
         if state.status == "complete":
             return ProgressionDecision(
                 decision="advance",
@@ -234,9 +236,7 @@ def test_kernel_module_has_no_product_domain_imports() -> None:
     source_path = Path(__file__).parents[1] / "kernel.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     imported_modules = [
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
     ]
     imported_names = [
         alias.name

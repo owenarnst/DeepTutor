@@ -191,9 +191,7 @@ class MasteryLearningAdapter:
         due = self.due_reviews(moment)
         if due:
             task = due[0]
-            kp, module_id, module_name = self.find_knowledge_point(
-                progress, task.objective_id
-            )
+            kp, module_id, module_name = self.find_knowledge_point(progress, task.objective_id)
             if kp is not None:
                 return NextActionDecision(
                     action="review",
@@ -214,8 +212,10 @@ class MasteryLearningAdapter:
                     continue
                 status = self.objective_status(progress, kp)
                 gate = self._gate_kind(kp)
-                action = "probe" if status == "new" else (
-                    "assess" if gate == "qualitative" else "practice"
+                action = (
+                    "probe"
+                    if status == "new"
+                    else ("assess" if gate == "qualitative" else "practice")
                 )
                 reason = (
                     "Untouched objective — probe first to let the learner test out."
@@ -285,7 +285,9 @@ class MasteryLearningAdapter:
     def _gate_kind(kp: KnowledgePoint) -> str:
         return "qualitative" if kp.type in QUALITATIVE_TYPES else "quantitative"
 
-    def map_summary(self, progress: LearningProgress | None = None, *, now: float | None = None) -> dict:
+    def map_summary(
+        self, progress: LearningProgress | None = None, *, now: float | None = None
+    ) -> dict:
         progress = progress or self._require_progress()
         counts = {"mastered": 0, "learning": 0, "new": 0, "total": 0}
         modules_out: list[dict] = []
@@ -463,9 +465,7 @@ class MasteryLearningAdapter:
     def build_review_queue(self, progress: LearningProgress) -> list[ReviewTask]:
         return [self.to_product_task(item) for item in self.review_items_for(progress)]
 
-    def get_due_tasks(
-        self, progress: LearningProgress, max_tasks: int = 5
-    ) -> list[ReviewTask]:
+    def get_due_tasks(self, progress: LearningProgress, max_tasks: int = 5) -> list[ReviewTask]:
         moment = time.time()
         due = [
             self._review_item(task, is_due=True)
