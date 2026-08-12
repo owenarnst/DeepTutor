@@ -228,6 +228,48 @@ class TestGetDueTasks:
 
 
 class TestBuildReviewQueue:
+    def test_queue_reuses_repetition_state_and_stays_synchronized(self, scheduler):
+        state = RepetitionState(next_review_at=time.time())
+        lp = LearningProgress(book_id="b1")
+        lp.repetition_states["kp1"] = state
+        lp.knowledge_types["kp1"] = KnowledgeType.MEMORY
+
+        queue = scheduler.build_review_queue(lp)
+        assert queue[0].state is state
+
+        scheduler.schedule_next(state, KnowledgeType.MEMORY, True)
+        assert queue[0].state is state
+        assert queue[0].state.interval_index == state.interval_index == 1
+
+    def test_due_tasks_reuse_queued_task_and_state(self, scheduler):
+        state = RepetitionState(next_review_at=time.time() - 10)
+        task = ReviewTask(
+            id="r1",
+            knowledge_point_id="kp1",
+            knowledge_type=KnowledgeType.MEMORY,
+            due_at=state.next_review_at,
+            priority=1,
+            state=state,
+        )
+        lp = LearningProgress(book_id="b1", review_queue=[task])
+
+        due = scheduler.get_due_tasks(lp)
+        assert due[0] is task
+        assert due[0].state is state
+
+    def test_reopen_then_rebuild_rebinds_queue_to_canonical_state(self, scheduler):
+        state = RepetitionState(next_review_at=time.time())
+        progress = LearningProgress(book_id="b1")
+        progress.repetition_states["kp1"] = state
+        progress.knowledge_types["kp1"] = KnowledgeType.MEMORY
+        progress.review_queue = scheduler.build_review_queue(progress)
+
+        reopened = LearningProgress.model_validate_json(progress.model_dump_json())
+        assert reopened.review_queue[0].state is not reopened.repetition_states["kp1"]
+
+        rebuilt = scheduler.build_review_queue(reopened)
+        assert rebuilt[0].state is reopened.repetition_states["kp1"]
+
     def test_error_records_get_priority_1(self, scheduler):
         now = time.time()
         state = RepetitionState(next_review_at=now)

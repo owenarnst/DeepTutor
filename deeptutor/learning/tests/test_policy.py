@@ -142,6 +142,24 @@ def test_next_objective_due_review_beats_new_ground():
     assert step.knowledge_point_id == "kp1"
 
 
+def test_due_reviews_reuses_queued_task_and_state():
+    now = time.time()
+    state = RepetitionState(next_review_at=now - 10)
+    task = ReviewTask(
+        id="r1",
+        knowledge_point_id="kp1",
+        knowledge_type=KnowledgeType.MEMORY,
+        due_at=state.next_review_at,
+        priority=1,
+        state=state,
+    )
+    progress = LearningProgress(book_id="b1", review_queue=[task])
+
+    due = policy.due_reviews(progress, now=now)
+    assert due[0] is task
+    assert due[0].state is state
+
+
 def test_next_objective_complete_when_all_mastered():
     kp = _kp("kp1", KnowledgeType.MEMORY)
     progress = _progress(kp)

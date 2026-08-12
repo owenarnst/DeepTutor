@@ -434,7 +434,21 @@ class MasteryLearningAdapter:
         return tuple(due)
 
     @staticmethod
-    def to_product_state(schedule: ReviewSchedule) -> RepetitionState:
+    def to_product_state(
+        schedule: ReviewSchedule,
+        *,
+        existing: RepetitionState | None = None,
+    ) -> RepetitionState:
+        """Translate a neutral schedule without breaking legacy identity.
+
+        ``LearningProgress.repetition_states`` is a live product-owned map.
+        When a compatibility façade already has that state object, returning
+        it is part of the historical contract; the neutral schedule remains a
+        read-only decision value and does not replace the product object.
+        """
+
+        if existing is not None:
+            return existing
         return RepetitionState(
             interval_index=schedule.interval_index,
             consecutive_correct=schedule.consecutive_correct,
@@ -453,18 +467,36 @@ class MasteryLearningAdapter:
         )
 
     @staticmethod
-    def to_product_task(item: ReviewItem) -> ReviewTask:
+    def to_product_task(
+        item: ReviewItem,
+        *,
+        existing: ReviewTask | None = None,
+        existing_state: RepetitionState | None = None,
+    ) -> ReviewTask:
+        """Translate a review item while retaining legacy product objects."""
+
+        if existing is not None:
+            return existing
         return ReviewTask(
             id=item.item_id or f"review_{item.objective_id}",
             knowledge_point_id=item.objective_id,
             knowledge_type=KnowledgeType(item.category),
             due_at=item.due_at,
             priority=item.priority,
-            state=MasteryLearningAdapter.to_product_state(item.schedule),
+            state=MasteryLearningAdapter.to_product_state(
+                item.schedule,
+                existing=existing_state,
+            ),
         )
 
     def build_review_queue(self, progress: LearningProgress) -> list[ReviewTask]:
-        return [self.to_product_task(item) for item in self.review_items_for(progress)]
+        return [
+            self.to_product_task(
+                item,
+                existing_state=progress.repetition_states.get(item.objective_id),
+            )
+            for item in self.review_items_for(progress)
+        ]
 
     def get_due_tasks(self, progress: LearningProgress, max_tasks: int = 5) -> list[ReviewTask]:
         moment = time.time()
@@ -474,7 +506,11 @@ class MasteryLearningAdapter:
             if task.due_at <= moment
         ]
         due.sort(key=lambda item: item.priority)
-        return [self.to_product_task(item) for item in due[:max_tasks]]
+        queued_by_id = {task.id: task for task in progress.review_queue}
+        return [
+            self.to_product_task(item, existing=queued_by_id.get(item.item_id))
+            for item in due[:max_tasks]
+        ]
 
     # ── Product grading/scoring façade ───────────────────────────────────
 
