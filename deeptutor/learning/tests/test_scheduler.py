@@ -51,6 +51,32 @@ class TestInitialState:
         assert state.interval_index == 0
         assert abs(state.next_review_at - time.time() - 14 * 86400) < 5
 
+    def test_mutable_debug_mode_changes_initial_and_subsequent_intervals(self, scheduler):
+        scheduler.DEBUG_MODE = False
+        normal_initial = scheduler.get_initial_state(KnowledgeType.DESIGN)
+        assert scheduler.DEBUG_MODE is False
+        assert abs(normal_initial.next_review_at - time.time() - 14 * 86400) < 5
+
+        scheduler.DEBUG_MODE = True
+        debug_initial = scheduler.get_initial_state(KnowledgeType.DESIGN)
+        assert scheduler.DEBUG_MODE is True
+        assert abs(debug_initial.next_review_at - time.time() - 14) < 5
+
+        debug_state = scheduler.schedule_next(
+            RepetitionState(next_review_at=time.time()),
+            KnowledgeType.DESIGN,
+            True,
+        )
+        assert abs(debug_state.next_review_at - time.time() - 28) < 5
+
+        scheduler.DEBUG_MODE = False
+        normal_state = scheduler.schedule_next(
+            RepetitionState(next_review_at=time.time()),
+            KnowledgeType.DESIGN,
+            True,
+        )
+        assert abs(normal_state.next_review_at - time.time() - 28 * 86400) < 5
+
 
 # ── schedule_next: correct advances ──────────────────────────────────────
 

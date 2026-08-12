@@ -124,6 +124,7 @@ class MasteryLearningAdapter:
                     source="qualitative-assessment",
                 )
             )
+        evidence.sort(key=lambda item: item.observed_at)
         return tuple(evidence)
 
     def progression_decision(self, objective_id: str) -> ProgressionDecision:

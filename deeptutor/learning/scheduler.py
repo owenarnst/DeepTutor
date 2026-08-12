@@ -24,8 +24,16 @@ class SpacedRepetitionScheduler:
 
     def __init__(self) -> None:
         self._adapter = MasteryLearningAdapter()
-        # Existing callers inspect this attribute in debugging contexts.
-        self.DEBUG_MODE = self._adapter.debug_mode
+
+    @property
+    def DEBUG_MODE(self) -> bool:
+        """Legacy mutable flag synchronized with the product adapter."""
+
+        return self._adapter.debug_mode
+
+    @DEBUG_MODE.setter
+    def DEBUG_MODE(self, value: bool) -> None:
+        self._adapter.debug_mode = bool(value)
 
     def get_initial_state(self, knowledge_type: KnowledgeType) -> RepetitionState:
         schedule = self._adapter.initial_review_schedule(knowledge_type)
