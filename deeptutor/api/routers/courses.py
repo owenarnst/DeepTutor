@@ -1,25 +1,49 @@
-"""Authenticated Course Mode create/list/detail routes."""
+"""Authenticated Course Mode import, processing, and manifest routes."""
 
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+import json
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query, Response, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
-from deeptutor.course_mode.models import Course
+from deeptutor.course_mode.models import (
+    Course,
+    CourseJobStatus,
+    CourseManifest,
+    CourseProcessingJob,
+    ManifestRole,
+    ManifestVisibility,
+)
 from deeptutor.course_mode.repository import (
     DEFAULT_COURSE_LIST_LIMIT,
     MAX_COURSE_LIST_LIMIT,
     MAX_COURSE_LIST_OFFSET,
+    CourseImportResult,
     CourseInput,
     CourseQuotaExceededError,
     CourseRepository,
     IdempotencyConflictError,
     InvalidCourseIdentifierError,
     InvalidCourseInputError,
+    InvalidJobRetryError,
+    InvalidManifestError,
+    InvalidManifestStateError,
     InvalidRequestKeyError,
+    ManifestApprovalBlockedError,
+    ManifestRevisionConflictError,
+)
+from deeptutor.course_mode.source_processing import (
+    COURSE_MAX_FILE_BYTES,
+    COURSE_MAX_TOTAL_BYTES,
+    COURSE_MAX_UPLOAD_COUNT,
+    CourseUpload,
+    InvalidCourseSourceError,
+    course_file_limit,
 )
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.multi_user.paths import get_current_course_path_service
@@ -39,19 +63,32 @@ IdempotencyKey = Annotated[
 
 
 class CreateCourseRequest(BaseModel):
+    """Document the strict multipart creation fields for OpenAPI consumers."""
+
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
-    unit_title: str = Field(default="Unit 1", min_length=1, max_length=200)
+    unit_title: str = Field(min_length=1, max_length=200)
+    desired_outcome: str = Field(min_length=1, max_length=2000)
+    weekly_minutes: int = Field(ge=1, le=10_080)
+    ocw_url: str
+    scheduling: str | None = Field(default=None, max_length=2000)
+    difficulty: str | None = Field(default=None, max_length=2000)
+    accessibility: str | None = Field(default=None, max_length=2000)
 
 
 class CourseResponse(BaseModel):
     course: Course
 
 
+class ProcessingResponse(BaseModel):
+    job: CourseProcessingJob
+
+
 class CreateCourseResponse(CourseResponse):
     created: bool
+    processing_job: CourseProcessingJob
 
 
 class CourseListResponse(BaseModel):
@@ -59,6 +96,80 @@ class CourseListResponse(BaseModel):
     total: int
     has_more: bool
     next_offset: int | None
+
+
+class ManifestEntryUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    role: ManifestRole | None = None
+    visibility: ManifestVisibility | None = None
+    role_confirmed: bool | None = None
+    visibility_confirmed: bool | None = None
+
+
+class ManifestUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int = Field(ge=0)
+    entries: list[ManifestEntryUpdate] = Field(min_length=1)
+
+
+class ManifestApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int = Field(ge=0)
+
+
+class _CourseMultipartParser(MultiPartParser):
+    """Stream Course uploads with byte budgets before Starlette writes chunks."""
+
+    def __init__(self, request: Request) -> None:
+        super().__init__(
+            request.headers,
+            request.stream(),
+            max_files=COURSE_MAX_UPLOAD_COUNT,
+            max_part_size=64 * 1024,
+        )
+        self._course_total_file_bytes = 0
+        self._course_current_file_bytes = 0
+        self._course_current_file_limit = COURSE_MAX_FILE_BYTES
+
+    def on_part_begin(self) -> None:
+        super().on_part_begin()
+        self._course_current_file_bytes = 0
+        self._course_current_file_limit = COURSE_MAX_FILE_BYTES
+
+    def on_headers_finished(self) -> None:
+        try:
+            super().on_headers_finished()
+        except MultiPartException as exc:
+            if str(exc).startswith("Too many files"):
+                raise MultiPartException(
+                    "Course source file count exceeds the request limit"
+                ) from exc
+            raise
+        if self._current_part.file is not None:
+            filename = self._current_part.file.filename or ""
+            self._course_current_file_limit = course_file_limit(
+                filename,
+                max_file_bytes=COURSE_MAX_FILE_BYTES,
+            )
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        message_bytes = data[start:end]
+        if self._current_part.file is None:
+            super().on_part_data(data, start, end)
+            return
+        next_file_size = self._course_current_file_bytes + len(message_bytes)
+        if next_file_size > self._course_current_file_limit:
+            raise MultiPartException("Uploaded source exceeds the per-file size limit")
+        next_total_size = self._course_total_file_bytes + len(message_bytes)
+        if next_total_size > COURSE_MAX_TOTAL_BYTES:
+            raise MultiPartException("Uploaded Course sources exceed the batch size limit")
+        self._course_current_file_bytes = next_file_size
+        self._course_total_file_bytes = next_total_size
+        self._file_parts_to_write.append((self._current_part, message_bytes))
 
 
 def get_course_repository() -> CourseRepository:
@@ -71,33 +182,212 @@ def get_course_repository() -> CourseRepository:
     )
 
 
+def _safe_error(exc: Exception, *, default: str) -> HTTPException:
+    if isinstance(exc, IdempotencyConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, CourseQuotaExceededError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, InvalidCourseIdentifierError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+    if isinstance(
+        exc,
+        (
+            InvalidCourseInputError,
+            InvalidCourseSourceError,
+            InvalidRequestKeyError,
+            InvalidManifestError,
+        ),
+    ):
+        return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    if isinstance(exc, InvalidManifestStateError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, ManifestRevisionConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if isinstance(exc, ManifestApprovalBlockedError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "manifest_review_incomplete", "blockers": list(exc.blockers)},
+        )
+    if isinstance(exc, InvalidJobRetryError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=default)
+
+
+def _form_value(form: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        value = form.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def _required_form_text(value: Any, label: str, *, default: str = "") -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise InvalidCourseInputError(f"{label} must be text")
+    return value
+
+
+def _optional_form_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise InvalidCourseInputError("Optional Course input is invalid") from exc
+
+
+async def _parse_multipart_course(request: Request) -> tuple[CourseInput, list[CourseUpload]]:
+    content_type = request.headers.get("content-type", "").lower()
+    if not content_type.startswith("multipart/form-data"):
+        # The source-less JSON pilot contract is intentionally retired. Keep
+        # this explicit so clients cannot accidentally create an unprocessable
+        # Course while believing an upload was accepted.
+        raise InvalidCourseSourceError("Course creation requires at least one uploaded source file")
+    uploads: list[CourseUpload] = []
+    try:
+        # Parse directly from the ASGI stream. Starlette's stock parser writes
+        # file chunks as they arrive; the Course subclass rejects a chunk that
+        # would cross any budget before that chunk is queued for its temp file.
+        form = await _CourseMultipartParser(request).parse()
+    except MultiPartException as exc:
+        raise InvalidCourseSourceError(str(exc)) from exc
+    except Exception as exc:
+        raise InvalidCourseSourceError(
+            "Course multipart payload is invalid or exceeds request limits"
+        ) from exc
+
+    try:
+        if form.get("user_id") is not None or form.get("owner_scope") is not None:
+            raise InvalidCourseInputError("Course ownership is assigned by authentication")
+        title = _form_value(form, "title")
+        unit_title = _form_value(form, "unit_title", "unitTitle")
+        desired_outcome = _form_value(form, "desired_outcome", "desiredOutcome")
+        weekly_minutes_raw = _form_value(form, "weekly_minutes", "weeklyMinutes")
+        ocw_url = _form_value(form, "ocw_url", "ocwUrl", "source_url")
+        title_text = _required_form_text(title, "Title")
+        unit_title_text = _required_form_text(unit_title, "Unit title")
+        desired_outcome_text = _required_form_text(desired_outcome, "Desired outcome")
+        ocw_url_text = _required_form_text(ocw_url, "OCW URL")
+        try:
+            weekly_minutes = int(weekly_minutes_raw)
+        except (TypeError, ValueError) as exc:
+            raise InvalidCourseInputError("Weekly minutes must be an integer") from exc
+        for field_name in ("files", "uploads", "source_files", "file"):
+            for item in form.getlist(field_name):
+                if isinstance(item, StarletteUploadFile):
+                    await item.seek(0)
+                    uploads.append(
+                        CourseUpload(
+                            filename=item.filename or "",
+                            stream=item.file,
+                            declared_size=item.size,
+                        )
+                    )
+            if uploads:
+                break
+        course_input = CourseInput(
+            title=title_text,
+            description=_required_form_text(
+                _form_value(form, "description", default=""), "Description"
+            ),
+            unit_title=unit_title_text,
+            desired_outcome=desired_outcome_text,
+            weekly_minutes=weekly_minutes,
+            ocw_url=ocw_url_text,
+            scheduling=_optional_form_text(_form_value(form, "scheduling", "schedule")),
+            difficulty=_optional_form_text(_form_value(form, "difficulty")),
+            accessibility=_optional_form_text(_form_value(form, "accessibility")),
+        )
+        return course_input, uploads
+    except Exception:
+        for upload in uploads:
+            upload.close()
+        raise
+    finally:
+        returned_streams = {id(upload.stream) for upload in uploads}
+        for _field_name, item in form.multi_items():
+            if isinstance(item, StarletteUploadFile) and id(item.file) not in returned_streams:
+                await item.close()
+
+
+def _course_response(result: CourseImportResult) -> CreateCourseResponse:
+    return CreateCourseResponse(
+        course=result.course,
+        created=result.created,
+        processing_job=result.processing_job,
+    )
+
+
 @router.post("", response_model=CreateCourseResponse)
 async def create_course(
-    body: CreateCourseRequest,
+    request: Request,
     response: Response,
     idempotency_key: IdempotencyKey,
 ) -> CreateCourseResponse:
+    uploads: list[CourseUpload] = []
+    try:
+        course_input, uploads = await _parse_multipart_course(request)
+        repository = get_course_repository()
+        result = await asyncio.to_thread(
+            repository.create_import,
+            idempotency_key,
+            course_input,
+            uploads,
+        )
+        if result.processing_job.status is CourseJobStatus.QUEUED:
+            job = await asyncio.to_thread(repository.process_import, result.processing_job.id)
+            result = CourseImportResult(
+                course=repository.get(result.course.id) or result.course,
+                processing_job=job,
+                created=result.created,
+            )
+    except Exception as exc:
+        raise _safe_error(exc, default="Course import could not be created") from exc
+    finally:
+        for upload in uploads:
+            await asyncio.to_thread(upload.close)
+    response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
+    return _course_response(result)
+
+
+@router.get("/jobs/{job_id}", response_model=ProcessingResponse)
+async def get_processing_job(job_id: str) -> ProcessingResponse:
     repository = get_course_repository()
     try:
-        result = await asyncio.to_thread(
-            repository.create_draft,
-            idempotency_key,
-            CourseInput(
-                title=body.title,
-                description=body.description,
-                unit_title=body.unit_title,
-            ),
-        )
-    except IdempotencyConflictError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except (InvalidCourseInputError, InvalidRequestKeyError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
-        ) from exc
-    except CourseQuotaExceededError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
-    return CreateCourseResponse(course=result.course, created=result.created)
+        job = await asyncio.to_thread(repository.get_processing_job_by_id, job_id)
+    except InvalidCourseIdentifierError as exc:
+        raise HTTPException(status_code=400, detail="Processing job not found") from exc
+    if job is None:
+        raise HTTPException(status_code=404, detail="Processing job not found")
+    return ProcessingResponse(job=job)
+
+
+@router.post("/jobs/{job_id}/retry", response_model=ProcessingResponse)
+async def retry_processing_job(job_id: str) -> ProcessingResponse:
+    repository = get_course_repository()
+    try:
+        job = await asyncio.to_thread(repository.retry_import, job_id)
+    except Exception as exc:
+        raise _safe_error(exc, default="Processing job could not be retried") from exc
+    return ProcessingResponse(job=job)
+
+
+@router.post("/{course_id}/processing/retry", response_model=ProcessingResponse)
+@router.post("/{course_id}/retry", response_model=ProcessingResponse)
+async def retry_course_processing(course_id: str) -> ProcessingResponse:
+    repository = get_course_repository()
+    try:
+        current = await asyncio.to_thread(repository.get_processing_job, course_id)
+        if current is None:
+            raise InvalidCourseIdentifierError("Processing job not found")
+        job = await asyncio.to_thread(repository.retry_import, current.id)
+    except Exception as exc:
+        raise _safe_error(exc, default="Processing job could not be retried") from exc
+    return ProcessingResponse(job=job)
 
 
 @router.get("", response_model=CourseListResponse)
@@ -115,16 +405,66 @@ async def list_courses(
     )
 
 
+@router.get("/{course_id}/processing", response_model=ProcessingResponse)
+async def get_course_processing(course_id: str) -> ProcessingResponse:
+    repository = get_course_repository()
+    try:
+        job = await asyncio.to_thread(repository.get_processing_job, course_id)
+    except InvalidCourseIdentifierError as exc:
+        raise HTTPException(status_code=400, detail="Invalid course id") from exc
+    if job is None:
+        raise HTTPException(status_code=404, detail="Processing job not found")
+    return ProcessingResponse(job=job)
+
+
+@router.get("/{course_id}/manifest", response_model=CourseManifest)
+async def get_course_manifest(course_id: str) -> CourseManifest:
+    repository = get_course_repository()
+    try:
+        return await asyncio.to_thread(repository.get_manifest, course_id)
+    except InvalidCourseIdentifierError as exc:
+        raise HTTPException(status_code=404, detail="Course manifest not found") from exc
+
+
+@router.patch("/{course_id}/manifest", response_model=CourseManifest)
+@router.put("/{course_id}/manifest", response_model=CourseManifest)
+async def update_course_manifest(
+    course_id: str,
+    body: ManifestUpdateRequest,
+) -> CourseManifest:
+    repository = get_course_repository()
+    try:
+        updates = [entry.model_dump(exclude_none=True) for entry in body.entries]
+        return await asyncio.to_thread(
+            repository.update_manifest, course_id, body.revision, updates
+        )
+    except Exception as exc:
+        raise _safe_error(exc, default="Manifest could not be updated") from exc
+
+
+@router.post("/{course_id}/manifest/approve", response_model=CourseManifest)
+async def approve_course_manifest(
+    course_id: str,
+    body: ManifestApprovalRequest,
+) -> CourseManifest:
+    repository = get_course_repository()
+    try:
+        return await asyncio.to_thread(repository.approve_manifest, course_id, body.revision)
+    except Exception as exc:
+        raise _safe_error(exc, default="Manifest could not be approved") from exc
+
+
 @router.get("/{course_id}", response_model=CourseResponse)
 async def get_course(course_id: str) -> CourseResponse:
     repository = get_course_repository()
     try:
         course = await asyncio.to_thread(repository.get, course_id)
     except InvalidCourseIdentifierError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid course id"
-        ) from exc
+        raise HTTPException(status_code=400, detail="Invalid course id") from exc
     if course is None:
         # Missing and foreign courses intentionally share one response.
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Course not found")
+        raise HTTPException(status_code=404, detail="Course not found")
     return CourseResponse(course=course)
+
+
+__all__ = ["router", "get_course_repository"]

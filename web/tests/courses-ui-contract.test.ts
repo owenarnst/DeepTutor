@@ -36,3 +36,41 @@ test('create form retains a stable request key for the same manual retry', () =>
   assert.match(gallery, /existing\?\.fingerprint\s*===\s*fingerprint/)
   assert.match(gallery, /existing\.requestKey\s*:\s*crypto\.randomUUID\(\)/)
 })
+
+test('Course import UI captures the source contract and review workflow', () => {
+  assert.match(gallery, /Desired outcome/)
+  assert.match(gallery, /weekly_minutes/)
+  assert.match(gallery, /ocw_url/)
+  assert.match(gallery, /setInputFiles|Source files/)
+  assert.match(detail, /Source manifest review/)
+  assert.match(detail, /Approve manifest/)
+  assert.match(detail, /Retry stage/)
+})
+
+test('Course detail never treats rejected durable requests as ready', () => {
+  assert.match(detail, /Promise\.allSettled/)
+  assert.match(detail, /Processing status unavailable/)
+  assert.match(detail, /Manifest unavailable/)
+  assert.match(detail, /Retry status/)
+  assert.match(detail, /Retry manifest/)
+  assert.doesNotMatch(detail, /if \(!job\) return <span[^>]*>.*Course workspace ready/)
+})
+
+test('Course detail spinners respect reduced-motion preferences', () => {
+  assert.match(detail, /animate-spin motion-reduce:animate-none/)
+})
+
+test('Course gallery spinners respect reduced-motion preferences', () => {
+  assert.doesNotMatch(gallery, /animate-spin(?! motion-reduce:animate-none)/)
+  assert.match(gallery, /animate-spin motion-reduce:animate-none/)
+})
+
+test('queued imports expose recovery and completed manifests are read-only', () => {
+  assert.match(detail, /Course import is queued/)
+  assert.match(detail, /Resume processing/)
+  assert.match(detail, /status !== 'source_processing'/)
+  assert.match(detail, /reconcileManifestEntries/)
+  assert.match(detail, /readOnly=\{job\?\.status === 'completed' \|\| manifest\.eligible_for_planning\}/)
+  assert.match(detail, /!readOnly && <div className="mt-5/)
+  assert.match(detail, /disabled={readOnly}/)
+})

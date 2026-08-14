@@ -458,6 +458,34 @@ def _save_uploaded_files(
     return uploaded_files, uploaded_file_paths
 
 
+async def _save_uploaded_files_off_loop(
+    files: list[UploadFile],
+    target_dir: Path,
+    allowed_extensions: set[str] | None = None,
+    kb_name: str | None = None,
+    rel_paths: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """:func:`_save_uploaded_files` on a worker thread.
+
+    That function blocks end to end — a chunked write of every uploaded byte,
+    zip extraction for archive members, and (when PocketBase is enabled) one
+    synchronous HTTP upload per file. Called inline from an ``async def``
+    route it held the event loop for the whole batch, so every other request
+    — chat WebSockets included — stalled until the upload finished (#777).
+
+    Safe to hand to a thread: it only touches ``UploadFile.file``, the plain
+    ``SpooledTemporaryFile`` underneath, never the async ``UploadFile`` API.
+    """
+    return await asyncio.to_thread(
+        _save_uploaded_files,
+        files,
+        target_dir,
+        allowed_extensions=allowed_extensions,
+        kb_name=kb_name,
+        rel_paths=rel_paths,
+    )
+
+
 def _get_upload_file_size(file: UploadFile) -> int | None:
     """Best-effort byte size detection without consuming the uploaded stream."""
     try:
@@ -853,7 +881,14 @@ async def run_upload_processing_task(
                 rag_provider=rag_provider,
             )
 
-            staged_files = adder.add_documents(uploaded_file_paths, allow_duplicates=False)
+            # Staging blocks: a full-content hash per file, plus a copy for
+            # anything not already under raw/. A BackgroundTasks entry declared
+            # ``async def`` is awaited ON the event loop — starlette only routes
+            # *sync* callables to its threadpool — so doing this inline stalled
+            # every other request for the length of the batch (#777).
+            staged_files = await asyncio.to_thread(
+                adder.add_documents, uploaded_file_paths, allow_duplicates=False
+            )
             _task_log(task_id, f"Staged {len(staged_files)} new file(s)")
 
             if not staged_files:
@@ -1657,12 +1692,94 @@ async def connect_lightrag_server_route(payload: ConnectLightRagServerRequest):
     }
 
 
+class ProbeImaRequest(BaseModel):
+    client_id: str
+    api_key: str
+    knowledge_base_id: str
+
+
+class ConnectImaRequest(BaseModel):
+    name: str
+    client_id: str
+    api_key: str
+    knowledge_base_id: str
+
+
+@router.post("/probe-ima")
+async def probe_ima_route(payload: ProbeImaRequest):
+    """Test-connect to a Tencent IMA knowledge base before binding a KB to it.
+
+    Returns the verdict (credentials accepted? does the library id resolve, and
+    what is it called?) so the UI can confirm before any registration happens.
+    Creates nothing.
+    """
+    from deeptutor.services.rag.pipelines.ima.probe import probe_knowledge_base
+
+    result = await probe_knowledge_base(
+        payload.client_id,
+        payload.api_key,
+        payload.knowledge_base_id,
+    )
+    return result.to_dict()
+
+
+@router.post("/connect-ima")
+async def connect_ima_route(payload: ConnectImaRequest):
+    """Connect a Tencent IMA knowledge base as a retrieval-only knowledge base.
+
+    Re-probes server-side (never trusts the client's verdict), then registers a
+    pointer (``type: ima``). Retrieval is offloaded to IMA's ``search_knowledge``
+    OpenAPI — no copy, no local index.
+    """
+    from deeptutor.services.rag.pipelines.ima.probe import probe_knowledge_base
+
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Knowledge base name is required.")
+
+    result = await probe_knowledge_base(
+        payload.client_id,
+        payload.api_key,
+        payload.knowledge_base_id,
+    )
+    if not result.ok:
+        raise HTTPException(
+            status_code=400,
+            detail=result.error or "Could not connect to the IMA knowledge base.",
+        )
+
+    try:
+        manager = get_kb_manager()
+        entry = manager.register_ima_kb(
+            name,
+            payload.client_id,
+            payload.api_key,
+            payload.knowledge_base_id,
+            description=result.description or "",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error connecting IMA knowledge base: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "status": "connected",
+        "name": name,
+        "knowledge_base_id": entry["knowledge_base_id"],
+        "rag_provider": entry["rag_provider"],
+    }
+
+
 @router.get("/list", response_model=list[KnowledgeBaseInfo])
 async def list_knowledge_bases():
     """List all available knowledge bases with their details."""
     try:
         manager = get_kb_manager()
         kb_names = manager.list_knowledge_bases()
+        default_name = manager.get_default(available_names=kb_names)
         access_items = list_visible_kb_access()
         access_by_id = {str(item.get("id") or ""): item for item in access_items}
         own_prefix = "admin:kb:" if get_current_user().is_admin else "user:kb:"
@@ -1674,7 +1791,11 @@ async def list_knowledge_bases():
 
         for name in kb_names:
             try:
-                info = manager.get_info(name)
+                info = manager.get_info(
+                    name,
+                    refresh_config=False,
+                    default_name=default_name,
+                )
                 logger.debug(f"Successfully got info for KB '{name}': {info.get('statistics', {})}")
                 result.append(
                     KnowledgeBaseInfo(
@@ -1711,7 +1832,7 @@ async def list_knowledge_bases():
                             KnowledgeBaseInfo(
                                 id=f"{own_prefix}{name}",
                                 name=name,
-                                is_default=name == manager.get_default(),
+                                is_default=name == default_name,
                                 statistics={
                                     "raw_documents": 0,
                                     "images": 0,
@@ -1740,6 +1861,7 @@ async def list_knowledge_bases():
 
         logger.debug(f"Returning {len(result)} knowledge bases")
         if not get_current_user().is_admin:
+            assigned_snapshots: dict[str, str | None] = {}
             own_ids = {item.id for item in result}
             for access in access_items:
                 if access.get("source") != "admin" or access.get("id") in own_ids:
@@ -1766,7 +1888,17 @@ async def list_knowledge_bases():
                 resource = resolve_kb(str(access.get("id") or access.get("name") or ""))
                 assigned_manager = manager_for_resource(resource)
                 try:
-                    info = assigned_manager.get_info(resource.name)
+                    manager_key = str(assigned_manager.base_dir.resolve())
+                    if manager_key not in assigned_snapshots:
+                        assigned_names = assigned_manager.list_knowledge_bases()
+                        assigned_snapshots[manager_key] = assigned_manager.get_default(
+                            available_names=assigned_names
+                        )
+                    info = assigned_manager.get_info(
+                        resource.name,
+                        refresh_config=False,
+                        default_name=assigned_snapshots[manager_key],
+                    )
                     result.append(
                         KnowledgeBaseInfo(
                             id=resource.id,
@@ -2098,7 +2230,7 @@ async def upload_files(
         # archive itself is never indexed (``safe_extract_zip`` skips ``.zip``).
         upload_extensions = allowed_extensions | {".zip"}
         _validate_upload_batch(files, allowed_extensions=upload_extensions, rel_paths=rel_paths)
-        uploaded_files, uploaded_file_paths = _save_uploaded_files(
+        uploaded_files, uploaded_file_paths = await _save_uploaded_files_off_loop(
             files, raw_dir, allowed_extensions=upload_extensions, rel_paths=rel_paths
         )
         task_id = _build_unique_task_id("kb_upload", kb_name)
@@ -2205,7 +2337,7 @@ async def create_knowledge_base(
             logger.warning(f"KB {name} not found in config, registering manually")
             initializer._register_to_config()
 
-        uploaded_files, _ = _save_uploaded_files(
+        uploaded_files, _ = await _save_uploaded_files_off_loop(
             files, initializer.raw_dir, allowed_extensions=allowed_extensions, rel_paths=rel_paths
         )
 

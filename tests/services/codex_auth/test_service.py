@@ -23,6 +23,7 @@ from deeptutor.services.codex_auth.service import (
     CodexOAuthService,
     codex_model_id,
     remove_codex_catalog,
+    ssh_forward_command,
     sync_codex_catalog,
 )
 from deeptutor.services.codex_auth.storage import CodexCredentialStore
@@ -35,21 +36,129 @@ def test_each_user_gets_their_own_codex_credential_root(
 ) -> None:
     """A Codex token authorizes one person's ChatGPT plan, so it is never pooled.
 
-    Resolving other accounts to the administrator's root would run an entire
-    deployment on a single subscription.
+    Resolving other accounts to the administrator's directory would run an
+    entire deployment on a single subscription. Asserted on the *live* seam
+    (``_codex_secrets_root``): ``_codex_user_root`` is now only the location a
+    pre-existing login is relocated from, so pinning it would leave this
+    guarantee unguarded.
     """
-    roots = {"admin": tmp_path / "admin-user", "learner": tmp_path / "regular-user"}
-    signed_in = {"who": "admin"}
-    monkeypatch.setattr(
-        service_module,
-        "get_path_service",
-        lambda: type("Paths", (), {"get_user_root": lambda self: roots[signed_in["who"]]})(),
+    from deeptutor.multi_user import paths as paths_module
+    from deeptutor.multi_user.context import reset_current_user, set_current_user
+    from deeptutor.multi_user.models import CurrentUser, UserScope
+
+    admin_root = (tmp_path / "data").resolve()
+    monkeypatch.setattr(paths_module, "ADMIN_WORKSPACE_ROOT", admin_root)
+    monkeypatch.setattr(paths_module, "USERS_ROOT", admin_root / "users")
+    monkeypatch.setattr(paths_module, "SYSTEM_ROOT", admin_root / "system")
+    monkeypatch.setattr(paths_module, "_path_services", {})
+    monkeypatch.setattr(service_module, "_RELOCATED_SECRET_ROOTS", set())
+
+    as_admin = service_module._codex_secrets_root()
+    scope = UserScope(kind="user", user_id="u_ada", root=admin_root / "users" / "u_ada")
+    token = set_current_user(CurrentUser(id="u_ada", username="ada", role="user", scope=scope))
+    try:
+        as_learner = service_module._codex_secrets_root()
+    finally:
+        reset_current_user(token)
+
+    assert as_admin != as_learner
+    assert as_learner.name == "u_ada"
+    # Who owns a scope is decided in multi_user.paths, not here: codex_auth must
+    # never reach for the admin root — or learn what a partner is — itself.
+    assert not hasattr(service_module, "get_admin_path_service")
+    assert not hasattr(service_module, "PARTNER_USER_PREFIX")
+
+
+def test_partner_turn_inherits_its_owner_codex_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A partner has a workspace but no account, so it borrows its owner's token.
+
+    Before #711 the credential store followed the partner scope to
+    ``data/partners/<id>/workspace/user``, found nothing, and failed in 0s.
+    """
+    from deeptutor.multi_user import paths as paths_module
+    from deeptutor.multi_user.context import reset_current_user, set_current_user
+    from deeptutor.services.partners.scope import partner_user
+
+    admin_root = (tmp_path / "data").resolve()
+    monkeypatch.setattr(paths_module, "ADMIN_WORKSPACE_ROOT", admin_root)
+    monkeypatch.setattr(paths_module, "USERS_ROOT", admin_root / "users")
+    monkeypatch.setattr(paths_module, "SYSTEM_ROOT", admin_root / "system")
+    monkeypatch.setattr(paths_module, "_path_services", {})
+    monkeypatch.setattr(service_module, "_RELOCATED_SECRET_ROOTS", set())
+
+    as_admin = service_module._codex_secrets_root()
+    token = set_current_user(partner_user("ada"))
+    try:
+        assert service_module._codex_secrets_root() == as_admin
+        assert service_module._codex_user_root() == admin_root / "user"
+    finally:
+        reset_current_user(token)
+
+
+def test_ssh_forward_command_maps_callback_to_frontend_port() -> None:
+    assert (
+        ssh_forward_command(1457, 4782) == "ssh -N -L 1457:127.0.0.1:4782 <ssh-user>@<server-host>"
     )
 
-    assert service_module._codex_user_root() == roots["admin"]
-    signed_in["who"] = "learner"
-    assert service_module._codex_user_root() == roots["learner"]
-    assert not hasattr(service_module, "get_admin_path_service")
+
+@pytest.mark.parametrize("callback_forward_port", [0, 65_536, True, "3782"])
+def test_callback_forward_port_must_be_a_valid_integer(
+    tmp_path: Path,
+    callback_forward_port: object,
+) -> None:
+    store = CodexCredentialStore(tmp_path)
+    model_catalog, _original = _seeded_service(tmp_path)
+
+    with pytest.raises(ValueError):
+        CodexOAuthService(
+            store,
+            FakeCatalog(_snapshot("live")),
+            model_catalog,
+            oauth_client=FakeOAuthClient(),
+            callback_forward_port=callback_forward_port,  # type: ignore[arg-type]
+        )
+
+
+def test_service_singleton_reads_frontend_port_only_when_created(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings_calls = 0
+    captured: dict[str, Any] = {}
+
+    def load_settings() -> dict[str, int]:
+        nonlocal settings_calls
+        settings_calls += 1
+        return {"frontend_port": 4782}
+
+    class CapturingService:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(service_module, "_SERVICE_INSTANCES", {})
+    monkeypatch.setattr(service_module, "_codex_secrets_root", lambda: tmp_path)
+    monkeypatch.setattr(service_module, "load_system_settings", load_settings)
+    monkeypatch.setattr(service_module, "CodexCredentialStore", lambda _root: object())
+    monkeypatch.setattr(
+        service_module,
+        "CodexModelCatalog",
+        lambda _store, *, http: object(),
+    )
+    monkeypatch.setattr(service_module, "CodexOAuthClient", lambda _http: object())
+    # A sign-in publishes into the OWNER's catalog, never the shared one that
+    # ``get_model_catalog_service`` resolves an ordinary user to (#781).
+    monkeypatch.setattr(service_module, "_owner_model_catalog_service", lambda: object())
+    monkeypatch.setattr(service_module, "CodexOAuthService", CapturingService)
+
+    first = service_module.get_codex_oauth_service()
+    second = service_module.get_codex_oauth_service()
+
+    assert first is second
+    assert settings_calls == 1
+    assert captured["callback_forward_port"] == 4782
 
 
 def _model(
@@ -57,6 +166,8 @@ def _model(
     *,
     display_name: str | None = None,
     priority: int = 1,
+    context_window: int | None = None,
+    max_context_window: int | None = None,
 ) -> CodexModel:
     return CodexModel(
         slug=slug,
@@ -68,6 +179,8 @@ def _model(
         supports_reasoning_summary=True,
         supports_parallel_tool_calls=True,
         use_responses_lite=False,
+        context_window=context_window,
+        max_context_window=max_context_window,
     )
 
 
@@ -137,7 +250,15 @@ def test_sync_publishes_a_read_only_owner_bound_codex_profile(tmp_path: Path) ->
 
     result = sync_codex_catalog(
         service,
-        _snapshot("live", _model("gpt-5.6-sol"), _model("gpt-5.6-terra", priority=2)),
+        _snapshot(
+            "live",
+            _model(
+                "gpt-5.6-sol",
+                context_window=272_000,
+                max_context_window=272_000,
+            ),
+            _model("gpt-5.6-terra", priority=2),
+        ),
     )
 
     profile = _managed_profile(result.catalog)
@@ -151,6 +272,24 @@ def test_sync_publishes_a_read_only_owner_bound_codex_profile(tmp_path: Path) ->
         "gpt-5.6-sol",
         "gpt-5.6-terra",
     ]
+    assert profile["models"][0]["context_window"] == "272000"
+    assert profile["models"][0]["context_window_source"] == "metadata"
+
+
+def test_sync_uses_max_context_window_when_current_window_is_missing(tmp_path: Path) -> None:
+    service = ModelCatalogService(tmp_path / "model_catalog.json")
+
+    result = sync_codex_catalog(
+        service,
+        _snapshot(
+            "live",
+            _model("gpt-5.6-sol", max_context_window=272_000),
+        ),
+    )
+
+    model = _managed_profile(result.catalog)["models"][0]
+    assert model["context_window"] == "272000"
+    assert model["context_window_source"] == "metadata"
 
 
 def test_signing_in_never_replaces_a_model_the_operator_already_chose(
@@ -263,6 +402,7 @@ class FakeCallback:
             asyncio.get_running_loop().create_future()
         )
         self.error = error
+        self.expected_state: str | None = None
 
     async def wait(self, timeout: float) -> OAuthCallbackResult:
         if self.error is not None:
@@ -275,14 +415,21 @@ class FakeCallback:
                 CodexAuthError("login_cancelled", "Codex sign-in was cancelled.", 409)
             )
 
+    def submit(self, result: OAuthCallbackResult) -> None:
+        if self._result.done():
+            raise CodexAuthError(
+                "login_not_active",
+                "Codex sign-in is not waiting for a callback.",
+                409,
+            )
+        self._result.set_result(result)
+
     def complete(self, authorize_url: str, *, code: str = "authorization-code") -> None:
         state = parse_qs(urlsplit(authorize_url).query)["state"][0]
-        self._result.set_result(OAuthCallbackResult(code=code, state=state, error=None))
+        self.submit(OAuthCallbackResult(code=code, state=state, error=None))
 
     def complete_with_state(self, state: str) -> None:
-        self._result.set_result(
-            OAuthCallbackResult(code="authorization-code", state=state, error=None)
-        )
+        self.submit(OAuthCallbackResult(code="authorization-code", state=state, error=None))
 
 
 class FakeOAuthClient:
@@ -386,6 +533,7 @@ async def _oauth_service(
     callback_error: CodexAuthError | None = None,
     catalog_error: CodexAuthError | None = None,
     clock: list[int] | None = None,
+    callback_forward_port: int = 3_782,
 ) -> tuple[
     CodexOAuthService,
     FakeCallback,
@@ -401,7 +549,8 @@ async def _oauth_service(
     store = CodexCredentialStore(tmp_path)
     model_catalog, _original = _seeded_service(tmp_path)
 
-    async def callback_factory() -> FakeCallback:
+    async def callback_factory(expected_state: str) -> FakeCallback:
+        callback.expected_state = expected_state
         return callback
 
     service = CodexOAuthService(
@@ -411,6 +560,7 @@ async def _oauth_service(
         oauth_client=oauth,
         callback_factory=callback_factory,
         clock=(lambda: (clock or [1_000])[0]),
+        callback_forward_port=callback_forward_port,
     )
     return service, callback, oauth, catalog, store, model_catalog
 
@@ -433,7 +583,10 @@ async def _wait_until_terminal(service: CodexOAuthService) -> dict[str, Any]:
 async def test_successful_live_login_keeps_the_existing_model_selection(
     tmp_path: Path,
 ) -> None:
-    service, callback, _oauth, _catalog, _store, model_catalog = await _oauth_service(tmp_path)
+    service, callback, _oauth, _catalog, _store, model_catalog = await _oauth_service(
+        tmp_path,
+        callback_forward_port=4_782,
+    )
     original_selection = _selection(model_catalog.load())
 
     started = await service.start_login()
@@ -442,15 +595,243 @@ async def test_successful_live_login_keeps_the_existing_model_selection(
     status = await _wait_until_terminal(service)
 
     assert duplicate == started
+    assert callback.expected_state == parse_qs(urlsplit(started["authorize_url"]).query)["state"][0]
     assert status["connection"] == "connected"
     assert status["operation_state"] == "completed"
+    assert status["authorize_url"] is None
+    assert status["expires_in"] is None
     assert status["catalog_source"] == "live"
     # Codex is published but not activated, so it reports no active model of its
     # own and the deployment keeps running on whatever was already selected.
     assert status["active_model"] is None
     assert status["activated"] is False
     assert _selection(model_catalog.load()) == original_selection
-    assert set(started) == {"operation_id", "authorize_url", "expires_in"}
+    assert started["callback_port"] == 1455
+    assert started["callback_forward_port"] == 4782
+    assert started["redirect_uri"] == "http://localhost:1455/auth/callback"
+    assert (
+        started["ssh_forward_command"] == "ssh -N -L 1455:127.0.0.1:4782 <ssh-user>@<server-host>"
+    )
+    assert set(started) == {
+        "operation_id",
+        "authorize_url",
+        "expires_in",
+        "callback_port",
+        "callback_forward_port",
+        "redirect_uri",
+        "ssh_forward_command",
+    }
+
+
+@pytest.mark.asyncio
+async def test_callback_broker_keeps_waiting_after_wrong_state_then_completes(
+    tmp_path: Path,
+) -> None:
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+    started = await service.start_login()
+    expected_state = parse_qs(urlsplit(started["authorize_url"]).query)["state"][0]
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.receive_callback(
+            code="do-not-accept",
+            state="wrong-state",
+            error=None,
+        )
+
+    assert exc_info.value.code == "state_mismatch"
+    assert exc_info.value.http_status == 400
+    assert service.public_status()["operation_state"] == "waiting"
+
+    await service.receive_callback(
+        code="authorization-code",
+        state=expected_state,
+        error=None,
+    )
+    status = await _wait_until_terminal(service)
+    assert status["operation_state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_callback_delivery_finds_the_login_that_owns_the_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A callback must reach the account that started the login, not the default root.
+
+    The browser hits ``/auth/callback`` on the far end of its own tunnel, so the
+    request carries no session and cannot name a user. Routing by the OAuth
+    state is what keeps a non-administrator's sign-in from being delivered to
+    the default root instead.
+    """
+    default_root = tmp_path / "user"
+    member_root = tmp_path / "users" / "member"
+    default_root.mkdir(parents=True)
+    member_root.mkdir(parents=True)
+    default_service, *_ = await _oauth_service(default_root)
+    member_service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(member_root)
+    monkeypatch.setattr(
+        service_module,
+        "_SERVICE_INSTANCES",
+        {str(default_root): default_service, str(member_root): member_service},
+    )
+
+    started = await member_service.start_login()
+    member_state = parse_qs(urlsplit(started["authorize_url"]).query)["state"][0]
+
+    await service_module.deliver_codex_oauth_callback(
+        code="authorization-code",
+        state=member_state,
+        error=None,
+    )
+
+    status = await _wait_until_terminal(member_service)
+    assert status["operation_state"] == "completed"
+    assert default_service.public_status()["operation_state"] is None
+
+
+@pytest.mark.asyncio
+async def test_callback_delivery_rejects_a_state_no_login_owns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+    monkeypatch.setattr(service_module, "_SERVICE_INSTANCES", {str(tmp_path): service})
+    await service.start_login()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service_module.deliver_codex_oauth_callback(
+            code="do-not-accept",
+            state="wrong-state",
+            error=None,
+        )
+
+    assert exc_info.value.code == "state_mismatch"
+    assert exc_info.value.http_status == 400
+    assert service.public_status()["operation_state"] == "waiting"
+    await service.cancel_login()
+
+
+@pytest.mark.asyncio
+async def test_callback_delivery_rejects_when_nothing_is_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+    monkeypatch.setattr(service_module, "_SERVICE_INSTANCES", {str(tmp_path): service})
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service_module.deliver_codex_oauth_callback(
+            code="authorization-code",
+            state="untrusted-state",
+            error=None,
+        )
+
+    assert exc_info.value.code == "login_not_active"
+    assert exc_info.value.http_status == 409
+
+
+@pytest.mark.asyncio
+async def test_callback_broker_rejects_when_no_login_is_active(tmp_path: Path) -> None:
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.receive_callback(
+            code="authorization-code",
+            state="untrusted-state",
+            error=None,
+        )
+
+    assert exc_info.value.code == "login_not_active"
+    assert exc_info.value.http_status == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_state", ["snowman-\u2603", "a" * 129])
+async def test_callback_broker_rejects_malformed_state_without_ending_login(
+    tmp_path: Path,
+    invalid_state: str,
+) -> None:
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+    await service.start_login()
+
+    with pytest.raises(CodexAuthError) as exc_info:
+        await service.receive_callback(
+            code="do-not-accept",
+            state=invalid_state,
+            error=None,
+        )
+
+    assert exc_info.value.code == "state_mismatch"
+    assert exc_info.value.http_status == 400
+    assert service.public_status()["operation_state"] == "waiting"
+    await service.cancel_login()
+
+
+@pytest.mark.asyncio
+async def test_background_callback_unicode_state_has_stable_error(
+    tmp_path: Path,
+) -> None:
+    service, callback, _oauth, _catalog, _store, _models = await _oauth_service(tmp_path)
+    await service.start_login()
+
+    callback.complete_with_state("snowman-\u2603")
+    status = await _wait_until_terminal(service)
+
+    assert status["operation_state"] == "failed"
+    assert status["error_code"] == "state_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_login_status_keeps_callback_metadata_without_exposing_secrets(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000]
+    service, _callback, _oauth, _catalog, _store, _models = await _oauth_service(
+        tmp_path,
+        callback_error=CodexAuthError(
+            "login_timeout",
+            "Codex sign-in timed out.",
+            408,
+        ),
+        clock=clock,
+        callback_forward_port=4_782,
+    )
+
+    started = await service.start_login()
+    waiting = service.public_status()
+    clock[0] += 17
+    later_waiting = service.public_status()
+    timed_out = await _wait_until_terminal(service)
+
+    assert waiting["operation_state"] == "waiting"
+    assert waiting["authorize_url"] == started["authorize_url"]
+    assert waiting["expires_in"] == started["expires_in"]
+    assert later_waiting["authorize_url"] == started["authorize_url"]
+    assert later_waiting["expires_in"] == started["expires_in"] - 17
+    assert timed_out["operation_state"] == "expired"
+    for status in (waiting, timed_out):
+        assert status["callback_port"] == started["callback_port"] == 1455
+        assert status["callback_forward_port"] == started["callback_forward_port"] == 4782
+        assert (
+            status["redirect_uri"]
+            == started["redirect_uri"]
+            == "http://localhost:1455/auth/callback"
+        )
+    assert timed_out["authorize_url"] is None
+    assert timed_out["expires_in"] is None
+
+    forbidden_fields = {
+        "state_secret",
+        "pkce",
+        "verifier",
+        "access_token",
+        "refresh_token",
+        "account_id",
+        "email",
+    }
+    for payload in (started, waiting, timed_out):
+        serialized = json.loads(json.dumps(payload))
+        assert forbidden_fields.isdisjoint(serialized)
 
 
 @pytest.mark.asyncio
@@ -510,6 +891,8 @@ async def test_login_failures_do_not_overwrite_old_credentials(
     assert loaded is not None
     assert loaded.access_token == old.access_token
     assert status["operation_state"] == ("expired" if failure == "timeout" else "failed")
+    assert status["authorize_url"] is None
+    assert status["expires_in"] is None
 
 
 @pytest.mark.asyncio
@@ -524,6 +907,8 @@ async def test_cancel_login_preserves_existing_credentials(tmp_path: Path) -> No
     assert loaded is not None
     assert loaded.access_token == old.access_token
     assert status["operation_state"] == "cancelled"
+    assert status["authorize_url"] is None
+    assert status["expires_in"] is None
 
 
 @pytest.mark.asyncio
@@ -683,7 +1068,7 @@ async def test_restarted_service_restores_connection_without_operation_or_secret
         catalog,
         model_catalog,
         oauth_client=oauth,
-        callback_factory=lambda: None,  # type: ignore[arg-type,return-value]
+        callback_factory=lambda _state: None,  # type: ignore[arg-type,return-value]
         clock=lambda: 1_000,
     )
 
@@ -693,6 +1078,11 @@ async def test_restarted_service_restores_connection_without_operation_or_secret
     assert status["connection"] == "connected"
     assert status["operation_id"] is None
     assert status["operation_state"] is None
+    assert status["callback_port"] is None
+    assert status["callback_forward_port"] is None
+    assert status["redirect_uri"] is None
+    assert status["authorize_url"] is None
+    assert status["expires_in"] is None
     assert "top-secret" not in serialized
     assert "full-account-secret" not in serialized
 

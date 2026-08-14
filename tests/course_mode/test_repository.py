@@ -196,7 +196,7 @@ def test_initializes_an_existing_empty_database(paths: PathService) -> None:
     CourseRepository(paths, owner_scope="user-a").initialize()
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {
             row[0]
             for row in conn.execute(
@@ -265,7 +265,7 @@ def test_migrates_an_older_schema_without_losing_courses(paths: PathService) -> 
     assert existing.title == "Existing"
 
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_references)")}
         assert "relative_path" in columns
         assert "body" not in columns
@@ -381,7 +381,7 @@ def test_v3_migration_backfills_primary_unit_and_rejects_zero_unit_corruption(
 
     repository.initialize()
     with sqlite3.connect(repository.db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute(
             "SELECT primary_unit_id FROM courses WHERE id = ?", (valid.id,)
         ).fetchone() == (valid.units[0].id,)

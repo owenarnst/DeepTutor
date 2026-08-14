@@ -7,18 +7,17 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
+import logging
 from pathlib import Path
 import secrets
+import shutil
 import time
 from typing import Any
 
 import httpx
 
-from deeptutor.services.config.model_catalog import (
-    ModelCatalogService,
-    get_model_catalog_service,
-)
-from deeptutor.services.path_service import get_path_service
+from deeptutor.services.config.model_catalog import ModelCatalogService
+from deeptutor.services.config.runtime_settings import load_system_settings
 
 from .catalog import CodexModelCatalog
 from .constants import (
@@ -41,8 +40,11 @@ from .oauth import (
     PkceCodes,
     build_authorize_url,
     generate_pkce,
+    oauth_state_matches,
 )
 from .storage import CodexCredentialStore
+
+logger = logging.getLogger(__name__)
 
 MANAGED_BY = "openai_codex_oauth"
 CODEX_PROFILE_ID = "llm-profile-openai-codex-managed"
@@ -70,13 +72,17 @@ class _LoginOperation:
     task: asyncio.Task[None] | None = None
 
 
+def ssh_forward_command(callback_port: int, forward_port: int) -> str:
+    return f"ssh -N -L {callback_port}:127.0.0.1:{forward_port} <ssh-user>@<server-host>"
+
+
 def codex_model_id(slug: str) -> str:
     digest = hashlib.sha256(slug.encode("utf-8")).hexdigest()[:16]
     return f"llm-model-openai-codex-{digest}"
 
 
 def _managed_model(model: CodexModel) -> dict[str, Any]:
-    return {
+    managed = {
         "id": codex_model_id(model.slug),
         "name": model.display_name,
         "model": model.slug,
@@ -88,6 +94,11 @@ def _managed_model(model: CodexModel) -> dict[str, Any]:
         "codex_supports_parallel_tool_calls": model.supports_parallel_tool_calls,
         "codex_use_responses_lite": model.use_responses_lite,
     }
+    context_window = model.context_window or model.max_context_window
+    if context_window is not None:
+        managed["context_window"] = str(context_window)
+        managed["context_window_source"] = "metadata"
+    return managed
 
 
 def _managed_profile(snapshot: CatalogSnapshot) -> dict[str, Any]:
@@ -186,12 +197,20 @@ class CodexOAuthService:
         model_catalog: ModelCatalogService,
         *,
         oauth_client: CodexOAuthClient | None = None,
-        callback_factory: Callable[[], Awaitable[Any]] | None = None,
+        callback_factory: Callable[[str], Awaitable[Any]] | None = None,
         clock: Callable[[], float] = time.time,
+        callback_forward_port: int = 3782,
     ) -> None:
+        if (
+            isinstance(callback_forward_port, bool)
+            or not isinstance(callback_forward_port, int)
+            or not 1 <= callback_forward_port <= 65535
+        ):
+            raise ValueError("callback_forward_port must be between 1 and 65535")
         self._store = store
         self._catalog = catalog
         self._model_catalog = model_catalog
+        self._callback_forward_port = callback_forward_port
         self._owned_http: httpx.AsyncClient | None = None
         if oauth_client is None:
             self._owned_http = httpx.AsyncClient(timeout=30)
@@ -209,17 +228,20 @@ class CodexOAuthService:
         self._logging_out = False
 
     @staticmethod
-    async def _start_default_callback() -> LoopbackCallback:
-        return await LoopbackCallback.start(CODEX_CALLBACK_PORTS)
+    async def _start_default_callback(expected_state: str) -> LoopbackCallback:
+        return await LoopbackCallback.start(
+            CODEX_CALLBACK_PORTS,
+            expected_state=expected_state,
+        )
 
     async def start_login(self) -> dict[str, Any]:
         async with self._operation_lock:
             if self._operation_is_active():
                 return self._login_start_payload(self._operation)
 
-            callback = await self._callback_factory()
             pkce = generate_pkce()
             state_secret = secrets.token_urlsafe(32)
+            callback = await self._callback_factory(state_secret)
             redirect_uri = f"http://localhost:{callback.port}{CODEX_CALLBACK_PATH}"
             operation = _LoginOperation(
                 operation_id=secrets.token_urlsafe(24),
@@ -246,10 +268,18 @@ class CodexOAuthService:
                 "Codex sign-in has not been started.",
                 409,
             )
+        callback_port = operation.callback.port
         return {
             "operation_id": operation.operation_id,
             "authorize_url": operation.authorize_url,
             "expires_in": max(0, int(operation.deadline - self._clock())),
+            "callback_port": callback_port,
+            "callback_forward_port": self._callback_forward_port,
+            "redirect_uri": operation.redirect_uri,
+            "ssh_forward_command": ssh_forward_command(
+                callback_port,
+                self._callback_forward_port,
+            ),
         }
 
     def _operation_is_active(self) -> bool:
@@ -259,6 +289,43 @@ class CodexOAuthService:
             and operation.operation_state not in self._TERMINAL_STATES
             and (operation.task is None or not operation.task.done())
         )
+
+    def awaits_callback_state(self, state: str | None) -> bool:
+        """Whether this instance holds the active login that owns ``state``.
+
+        Read without the operation lock: the caller only uses this to pick a
+        recipient, and :meth:`receive_callback` revalidates under the lock.
+        """
+        operation = self._operation
+        if operation is None or not self._operation_is_active():
+            return False
+        return oauth_state_matches(state, operation.state_secret)
+
+    def awaits_callback(self) -> bool:
+        """Whether this instance has a login waiting for a browser callback."""
+        return self._operation is not None and self._operation_is_active()
+
+    async def receive_callback(
+        self,
+        code: str | None,
+        state: str | None,
+        error: str | None,
+    ) -> None:
+        async with self._operation_lock:
+            operation = self._operation
+            if operation is None or not self._operation_is_active():
+                raise CodexAuthError(
+                    "login_not_active",
+                    "Codex sign-in is not waiting for a callback.",
+                    409,
+                )
+            if not oauth_state_matches(state, operation.state_secret):
+                raise CodexAuthError(
+                    "state_mismatch",
+                    "Codex sign-in returned an invalid state.",
+                    400,
+                )
+            operation.callback.submit(OAuthCallbackResult(code=code, state=state, error=error))
 
     async def _run_login(self, operation: _LoginOperation) -> None:
         try:
@@ -315,10 +382,7 @@ class CodexOAuthService:
                 else "oauth_callback_failed"
             )
             raise CodexAuthError(code, "Codex sign-in was not authorized.", 401)
-        if callback.state is None or not secrets.compare_digest(
-            callback.state,
-            expected_state,
-        ):
+        if not oauth_state_matches(callback.state, expected_state):
             raise CodexAuthError(
                 "state_mismatch",
                 "Codex sign-in returned an invalid state.",
@@ -485,6 +549,19 @@ class CodexOAuthService:
             "connection": connection,
             "operation_id": operation.operation_id if operation is not None else None,
             "operation_state": (operation.operation_state if operation is not None else None),
+            "authorize_url": (
+                operation.authorize_url if active_operation and operation is not None else None
+            ),
+            "expires_in": (
+                max(0, int(operation.deadline - self._clock()))
+                if active_operation and operation is not None
+                else None
+            ),
+            "callback_port": (operation.callback.port if operation is not None else None),
+            "callback_forward_port": (
+                self._callback_forward_port if operation is not None else None
+            ),
+            "redirect_uri": operation.redirect_uri if operation is not None else None,
             "model_count": len(snapshot.models) if snapshot is not None else 0,
             "catalog_source": snapshot.source if snapshot is not None else None,
             "catalog_fetched_at": (snapshot.fetched_at if snapshot is not None else None),
@@ -618,34 +695,171 @@ class CodexOAuthService:
 
 
 _SERVICE_INSTANCES: dict[str, CodexOAuthService] = {}
+_RELOCATED_SECRET_ROOTS: set[str] = set()
 
 
 def _codex_user_root() -> Path:
-    """Anchor the credential store to the caller's own root.
+    """Resolve the user root of the account that owns the caller's scope.
 
     A Codex token is issued against one person's ChatGPT plan. Resolving other
     users to the administrator's root would run a whole deployment on a single
     subscription, so every account signs in for itself or does not use Codex.
+    Owner resolution is what keeps that true while still letting a partner —
+    a synthetic user with a workspace but no account — inherit the login of
+    the person who owns it (#711).
+
+    This is where the store used to live; :func:`_codex_secrets_root` is where
+    it lives now, and this is only the location it is relocated from.
     """
-    return get_path_service().get_user_root().resolve()
+    from deeptutor.multi_user.paths import get_owner_path_service
+
+    return get_owner_path_service().get_user_root().resolve()
+
+
+def _codex_secrets_root() -> Path:
+    """Resolve the owner's secret root, moving an older login into it on first use.
+
+    For a non-admin account the user root of :func:`_codex_user_root` sits
+    inside the workspace subtree the sandbox runner mounts, so a refresh token
+    stored there was readable by every other account's ``exec`` (the admin's own
+    root was never mounted — only ``data/user/workspace`` is). ``data/system``
+    is mounted for nobody, so the store now lives under the owner's directory
+    there instead, keyed by the same owner resolution as before.
+    """
+    from deeptutor.multi_user.paths import get_owner_secrets_dir
+
+    secrets_root = get_owner_secrets_dir()
+    key = str(secrets_root)
+    if key not in _RELOCATED_SECRET_ROOTS:
+        # Memoised only on success: a relocation that failed (a permission
+        # problem, say) leaves the token in the exposed location, and retrying
+        # on the next resolution is strictly better than deciding once per
+        # process that the move is done.
+        if _relocate_legacy_store(_codex_user_root(), secrets_root):
+            _RELOCATED_SECRET_ROOTS.add(key)
+    return secrets_root
+
+
+def _relocate_legacy_store(user_root: Path, secrets_root: Path) -> bool:
+    """Move a login out of the sandbox-visible tree by rename, never by copy.
+
+    A copy would leave the plaintext refresh token exactly where the exposure
+    was, so this relocates the whole store directory or does nothing at all: a
+    login already at the safe location wins, and the stale one is reported for
+    an operator to remove by hand, mirroring
+    :func:`~deeptutor.multi_user.paths.migrate_legacy_multi_user_tree`.
+
+    Returns whether the legacy location is now settled — i.e. whether there is
+    nothing left to retry.
+    """
+    legacy = CodexCredentialStore(user_root)
+    target = CodexCredentialStore(secrets_root).root
+    try:
+        # The legacy tree is inside a subtree other accounts' sandboxed exec can
+        # write. Checking only the leaf is not enough: a symlinked ``private/``
+        # would make this relocate *another* account's store into this owner's
+        # secrets dir, where the server would then use it as their login.
+        legacy.assert_safe_location()
+    except CodexAuthError:
+        logger.warning(
+            "Refusing to relocate Codex credentials: %s is not a plain directory",
+            legacy.root,
+        )
+        return True  # nothing we will ever move; do not retry
+    if not legacy.root.is_dir():
+        return True
+    if target.exists():
+        logger.warning(
+            "Codex credentials already exist at %s; the sandbox-visible copy at "
+            "%s was left untouched and should be removed by hand",
+            target,
+            legacy.root,
+        )
+        return True
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy.root), str(target))
+    except OSError:
+        # A failed copy leaves a partial target and an intact source; a failed
+        # source cleanup leaves a complete target. Only the former is safe to
+        # discard, and the credential file is what tells the two apart.
+        if legacy.credentials_path.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        logger.warning("Could not relocate Codex credentials %s -> %s", legacy.root, target)
+        return False
+    logger.info("Relocated Codex credentials out of the sandbox-visible tree: %s", target)
+    return True
+
+
+def _owner_model_catalog_service() -> ModelCatalogService:
+    """The catalog a sign-in publishes its managed profile into.
+
+    Deliberately NOT :func:`get_model_catalog_service`, which resolves an
+    ordinary user to the *administrator's* catalog: a non-admin sign-in would
+    then write their personal Codex profile into the shared catalog, where it
+    would show up in the administrator's model list and in every other user's
+    resolution path. Owner scope keys this to the same account as the
+    credential store, so a login and its profile can never land in different
+    places (#781).
+    """
+    from deeptutor.multi_user.personal_models import owner_catalog_service
+
+    return owner_catalog_service()
 
 
 def get_codex_oauth_service() -> CodexOAuthService:
-    user_root = _codex_user_root()
-    key = str(user_root)
+    secrets_root = _codex_secrets_root()
+    key = str(secrets_root)
     service = _SERVICE_INSTANCES.get(key)
     if service is None:
-        store = CodexCredentialStore(user_root)
+        callback_forward_port = load_system_settings()["frontend_port"]
+        store = CodexCredentialStore(secrets_root)
         http = httpx.AsyncClient(timeout=30)
         catalog = CodexModelCatalog(store, http=http)
         service = CodexOAuthService(
             store,
             catalog,
-            get_model_catalog_service(),
+            _owner_model_catalog_service(),
             oauth_client=CodexOAuthClient(http),
+            callback_forward_port=callback_forward_port,
         )
         _SERVICE_INSTANCES[key] = service
     return service
+
+
+async def deliver_codex_oauth_callback(
+    code: str | None,
+    state: str | None,
+    error: str | None,
+) -> None:
+    """Hand a browser OAuth callback to whichever login is awaiting it.
+
+    The browser reaches ``/auth/callback`` on its own loopback address — the
+    far end of the user's tunnel — not on the DeepTutor Web origin, so the
+    request carries no session and the per-user service instance behind
+    :func:`get_codex_oauth_service` cannot be resolved from it. Resolving it
+    anyway would land every callback on the default root and strand every
+    non-administrator mid-login.
+
+    The OAuth ``state`` is the identity instead: it is a secret this process
+    minted for exactly one login, and it is compared in constant time. That is
+    already the trust model the loopback listener uses.
+    """
+    for service in list(_SERVICE_INSTANCES.values()):
+        if service.awaits_callback_state(state):
+            await service.receive_callback(code, state, error)
+            return
+    if any(service.awaits_callback() for service in list(_SERVICE_INSTANCES.values())):
+        raise CodexAuthError(
+            "state_mismatch",
+            "Codex sign-in returned an invalid state.",
+            400,
+        )
+    raise CodexAuthError(
+        "login_not_active",
+        "Codex sign-in is not waiting for a callback.",
+        409,
+    )
 
 
 __all__ = [
@@ -654,7 +868,9 @@ __all__ = [
     "CatalogSyncResult",
     "CodexOAuthService",
     "codex_model_id",
+    "deliver_codex_oauth_callback",
     "get_codex_oauth_service",
     "remove_codex_catalog",
+    "ssh_forward_command",
     "sync_codex_catalog",
 ]

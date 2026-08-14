@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { coursesApi, type CreateCourseInput } from '../lib/courses-api'
+import { coursesApi, type CreateCourseInput, type ManifestEntry } from '../lib/courses-api'
 
 const sampleCourse = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -36,13 +36,23 @@ test("create sends the caller's stable idempotency key without ownership", async
     title: 'Topology',
     description: 'Open sets',
     unit_title: 'Unit 1',
+    desired_outcome: 'Classify open and closed sets.',
+    weekly_minutes: 90,
+    ocw_url: 'https://ocw.mit.edu/courses/18-06sc-linear-algebra-fall-2011/',
+    files: [new File(['lecture notes'], 'notes.txt', { type: 'text/plain' })],
   }
   const restore = stubFetch((input, init) => {
     assert.equal(String(input), '/api/v1/courses')
     assert.equal(init?.method, 'POST')
     assert.equal(new Headers(init?.headers).get('Idempotency-Key'), 'browser-request-1')
-    assert.deepEqual(JSON.parse(String(init?.body)), payload)
-    assert.equal('user_id' in JSON.parse(String(init?.body)), false)
+    assert.equal(init?.body instanceof FormData, true)
+    const body = init?.body as FormData
+    assert.equal(body.get('title'), payload.title)
+    assert.equal(body.get('desired_outcome'), payload.desired_outcome)
+    assert.equal(body.get('weekly_minutes'), String(payload.weekly_minutes))
+    assert.equal(body.get('ocw_url'), payload.ocw_url)
+    assert.equal((body.get('files') as File).name, 'notes.txt')
+    assert.equal(body.get('user_id'), null)
     return Response.json({ course: sampleCourse, created: true }, { status: 201 })
   })
   try {
@@ -83,6 +93,50 @@ test('list and detail use retry-safe GETs and encode the course id', async () =>
   }
 })
 
+test('manifest updates serialize only the five backend-approved fields', async () => {
+  const entry: ManifestEntry = {
+    id: '44444444-4444-4444-8444-444444444444',
+    course_id: sampleCourse.id,
+    source_id: '55555555-5555-4555-8555-555555555555',
+    original_filename: 'lecture-notes.txt',
+    display_filename: 'lecture-notes.txt',
+    role: 'lecture_note',
+    visibility: 'learner_visible',
+    suspected_solution: false,
+    role_confirmed: true,
+    visibility_confirmed: true,
+    created_at: '2026-08-06T00:00:00+00:00',
+    updated_at: '2026-08-06T00:00:00+00:00',
+  }
+  const restore = stubFetch((input, init) => {
+    assert.equal(String(input), `/api/v1/courses/${sampleCourse.id}/manifest`)
+    const body = JSON.parse(String(init?.body)) as { revision: number; entries: object[] }
+    assert.equal(body.revision, 7)
+    assert.deepEqual(body.entries, [
+      {
+        id: entry.id,
+        role: entry.role,
+        visibility: entry.visibility,
+        role_confirmed: entry.role_confirmed,
+        visibility_confirmed: entry.visibility_confirmed,
+      },
+    ])
+    assert.deepEqual(Object.keys(body.entries[0]).sort(), [
+      'id',
+      'role',
+      'role_confirmed',
+      'visibility',
+      'visibility_confirmed',
+    ])
+    return Response.json({})
+  })
+  try {
+    await coursesApi.updateManifest(sampleCourse.id, 7, [entry])
+  } finally {
+    restore()
+  }
+})
+
 test("transport surfaces the backend's safe conflict detail", async () => {
   const restore = stubFetch(() =>
     Response.json(
@@ -92,7 +146,17 @@ test("transport surfaces the backend's safe conflict detail", async () => {
   )
   try {
     await assert.rejects(
-      coursesApi.create({ title: 'Changed' }, 'browser-request-1'),
+      coursesApi.create(
+        {
+          title: 'Changed',
+          unit_title: 'Unit 1',
+          desired_outcome: 'A different outcome.',
+          weekly_minutes: 90,
+          ocw_url: 'https://ocw.mit.edu/courses/18-06sc-linear-algebra-fall-2011/',
+          files: [new File(['changed notes'], 'notes.txt', { type: 'text/plain' })],
+        },
+        'browser-request-1'
+      ),
       /already used with different course input/
     )
   } finally {

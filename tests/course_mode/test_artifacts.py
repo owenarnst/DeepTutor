@@ -13,6 +13,7 @@ from deeptutor.course_mode.artifacts import (
     normalize_artifact_relative_path,
     open_course_artifact_for_read,
     remove_empty_course_workspace,
+    write_course_artifact_atomic,
 )
 from deeptutor.course_mode.repository import CourseInput, CourseRepository
 from deeptutor.services.path_service import PathService
@@ -118,7 +119,7 @@ def test_v2_artifact_schema_migrates_valid_rows_and_adds_composite_fk(
     repository.initialize()
 
     with sqlite3.connect(repository.db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
         assert conn.execute(
             "SELECT relative_path FROM artifact_references WHERE id = 'artifact-a'"
         ).fetchone() == ("notes/a.md",)
@@ -199,6 +200,23 @@ def test_artifact_read_rejects_symlinked_descendant(
     with pytest.raises(InvalidArtifactPathError, match="symlink|reparse"):
         with open_course_artifact_for_read(paths, course_id, "notes/lesson.md"):
             pass
+
+
+def test_artifact_write_rejects_symlinked_descendant(
+    paths: PathService,
+    tmp_path: Path,
+) -> None:
+    course_id = "11111111-1111-4111-8111-111111111111"
+    ensure_course_workspace(paths, course_id)
+    outside = tmp_path / "outside-write"
+    outside.mkdir()
+    (paths.get_course_workspace(course_id) / "sources").symlink_to(
+        outside, target_is_directory=True
+    )
+
+    with pytest.raises(InvalidArtifactPathError, match="symlink|reparse"):
+        write_course_artifact_atomic(paths, course_id, "sources/lesson.md", b"inside")
+    assert not (outside / "lesson.md").exists()
 
 
 @pytest.mark.skipif(

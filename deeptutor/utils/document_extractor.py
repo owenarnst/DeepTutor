@@ -31,35 +31,18 @@ from defusedxml.common import DefusedXmlException
 
 from deeptutor.services.rag.file_routing import FileTypeRouter
 
-try:
-    import fitz  # pymupdf
-except ImportError:  # pragma: no cover
-    fitz = None  # type: ignore[assignment]
-
-try:
-    from pypdf import PdfReader
-    from pypdf.errors import FileNotDecryptedError as _PypdfNotDecryptedError
-except ImportError:  # pragma: no cover
-    PdfReader = None  # type: ignore[assignment]
-    _PypdfNotDecryptedError = Exception  # type: ignore[assignment,misc]
-
-try:
-    from docx import Document as DocxDocument
-except ImportError:  # pragma: no cover
-    DocxDocument = None  # type: ignore[assignment]
-
-try:
-    from openpyxl import load_workbook
-except ImportError:  # pragma: no cover
-    load_workbook = None  # type: ignore[assignment]
-
-try:
-    from pptx import Presentation as PptxPresentation
-except ImportError:  # pragma: no cover
-    PptxPresentation = None  # type: ignore[assignment]
-
-
 logger = logging.getLogger(__name__)
+
+# Optional parser libraries are resolved on first use.  The public-ish module
+# names remain overrideable because downstream deployments and tests use
+# ``None`` to force the pure-OOXML fallback.
+_NOT_LOADED = object()
+fitz: Any = _NOT_LOADED
+PdfReader: Any = _NOT_LOADED
+_PypdfNotDecryptedError: Any = _NOT_LOADED
+DocxDocument: Any = _NOT_LOADED
+load_workbook: Any = _NOT_LOADED
+PptxPresentation: Any = _NOT_LOADED
 
 
 _OFFICE_EXTENSIONS: frozenset[str] = frozenset(FileTypeRouter.PARSER_EXTENSIONS)
@@ -76,6 +59,14 @@ MAX_DOC_BYTES = 20 * 1024 * 1024
 MAX_TOTAL_DOC_BYTES = 25 * 1024 * 1024
 MAX_EXTRACTED_CHARS_PER_DOC = 200_000
 MAX_EXTRACTED_CHARS_TOTAL = 150_000
+
+# Office Open XML is a ZIP package. These limits are checked from the central
+# directory before python-docx/openpyxl/python-pptx or the fallback XML parser
+# can read any member, bounding both archive metadata and expansion work.
+MAX_OOXML_MEMBER_COUNT = 2_048
+MAX_OOXML_MEMBER_EXPANDED_BYTES = 8 * 1024 * 1024
+MAX_OOXML_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_OOXML_COMPRESSION_RATIO = 200
 
 
 def _current_limits() -> tuple[int, int, int, int]:
@@ -196,6 +187,9 @@ def extract_text_from_bytes(
 
     _check_magic(ext, data, filename)
 
+    if ext in {".docx", ".xlsx", ".pptx"}:
+        _validate_ooxml_package(data, filename)
+
     if ext == ".pdf":
         text = _extract_pdf(data, filename)
     elif ext == ".docx":
@@ -231,6 +225,15 @@ def extract_text_from_path(
 
 
 def _extract_pdf(data: bytes, filename: str) -> str:
+    global fitz, PdfReader, _PypdfNotDecryptedError
+    if fitz is _NOT_LOADED:
+        try:
+            import fitz as fitz_module  # pymupdf
+
+            fitz = fitz_module
+        except ImportError:  # pragma: no cover
+            fitz = None
+
     if fitz is not None:
         try:
             with fitz.open(stream=data, filetype="pdf") as doc:
@@ -246,6 +249,17 @@ def _extract_pdf(data: bytes, filename: str) -> str:
             raise
         except Exception as exc:
             logger.warning("pymupdf failed on %s: %s — falling back to pypdf", filename, exc)
+
+    if PdfReader is _NOT_LOADED:
+        try:
+            from pypdf import PdfReader as reader_type
+            from pypdf.errors import FileNotDecryptedError
+
+            PdfReader = reader_type
+            _PypdfNotDecryptedError = FileNotDecryptedError
+        except ImportError:  # pragma: no cover
+            PdfReader = None
+            _PypdfNotDecryptedError = Exception
 
     if PdfReader is None:
         raise CorruptDocumentError(
@@ -276,6 +290,15 @@ def _extract_pdf(data: bytes, filename: str) -> str:
 
 
 def _extract_docx(data: bytes, filename: str) -> str:
+    global DocxDocument
+    if DocxDocument is _NOT_LOADED:
+        try:
+            from docx import Document as document_type
+
+            DocxDocument = document_type
+        except ImportError:  # pragma: no cover
+            DocxDocument = None
+
     primary_error: Exception | None = None
     primary_text = ""
     if DocxDocument is not None:
@@ -306,6 +329,15 @@ def _extract_docx(data: bytes, filename: str) -> str:
 
 
 def _extract_xlsx(data: bytes, filename: str) -> str:
+    global load_workbook
+    if load_workbook is _NOT_LOADED:
+        try:
+            from openpyxl import load_workbook as workbook_loader
+
+            load_workbook = workbook_loader
+        except ImportError:  # pragma: no cover
+            load_workbook = None
+
     if load_workbook is None:
         return _extract_xlsx_ooxml(data, filename)
     try:
@@ -335,6 +367,15 @@ def _extract_xlsx(data: bytes, filename: str) -> str:
 
 
 def _extract_pptx(data: bytes, filename: str) -> str:
+    global PptxPresentation
+    if PptxPresentation is _NOT_LOADED:
+        try:
+            from pptx import Presentation as presentation_type
+
+            PptxPresentation = presentation_type
+        except ImportError:  # pragma: no cover
+            PptxPresentation = None
+
     if PptxPresentation is None:
         return _extract_pptx_ooxml(data, filename)
     try:
@@ -373,11 +414,63 @@ def _extract_text_like(data: bytes, filename: str) -> str:
 
 
 def _open_ooxml(data: bytes, filename: str) -> zipfile.ZipFile:
+    _validate_ooxml_package(data, filename)
     try:
         return zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
         raise CorruptDocumentError(
             f"{filename}: failed to open Office ZIP package ({exc})", filename=filename
+        ) from exc
+
+
+def _validate_ooxml_package(data: bytes, filename: str) -> None:
+    """Reject ZIP expansion bombs before any Office parser consumes members."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = archive.infolist()
+            if len(members) > MAX_OOXML_MEMBER_COUNT:
+                raise CorruptDocumentError(
+                    f"{filename}: Office archive has too many members", filename=filename
+                )
+            expanded_total = 0
+            for member in members:
+                expanded_size = int(member.file_size)
+                compressed_size = int(member.compress_size)
+                if expanded_size < 0 or compressed_size < 0:
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive has invalid member sizes", filename=filename
+                    )
+                if expanded_size > MAX_OOXML_MEMBER_EXPANDED_BYTES:
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive member is too large", filename=filename
+                    )
+                expanded_total += expanded_size
+                if expanded_total > MAX_OOXML_EXPANDED_BYTES:
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive expands beyond its budget", filename=filename
+                    )
+                if (
+                    expanded_size
+                    and expanded_size / max(compressed_size, 1) > MAX_OOXML_COMPRESSION_RATIO
+                ):
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive compression ratio is unsafe", filename=filename
+                    )
+                member_name = member.filename.replace("\\", "/")
+                if (
+                    member_name.startswith("/")
+                    or "/../" in f"/{member_name}/"
+                    or "\x00" in member_name
+                ):
+                    raise CorruptDocumentError(
+                        f"{filename}: Office archive contains an unsafe member name",
+                        filename=filename,
+                    )
+    except CorruptDocumentError:
+        raise
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise CorruptDocumentError(
+            f"{filename}: failed to inspect Office archive", filename=filename
         ) from exc
 
 

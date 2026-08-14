@@ -1,4 +1,5 @@
-import ResponsiveWorkspaceNavigation from "@/components/sidebar/ResponsiveWorkspaceNavigation";
+import WorkspaceSidebar from "@/components/sidebar/WorkspaceSidebar";
+import AppShell from "@/components/layout/AppShell";
 import { CapabilityAccessProvider } from "@/components/access/CapabilityAccessContext";
 import CapabilityGate from "@/components/access/CapabilityGate";
 import { UnifiedChatProvider } from "@/context/UnifiedChatContext";
@@ -11,12 +12,9 @@ export default function WorkspaceLayout({
   return (
     <CapabilityAccessProvider>
       <UnifiedChatProvider>
-        <div className="flex h-screen min-w-0 flex-col overflow-hidden sm:flex-row">
-          <ResponsiveWorkspaceNavigation />
-          <main className="min-h-0 min-w-0 flex-1 overflow-hidden bg-[var(--background)]">
-            <CapabilityGate>{children}</CapabilityGate>
-          </main>
-        </div>
+        <AppShell sidebar={<WorkspaceSidebar />}>
+          <CapabilityGate>{children}</CapabilityGate>
+        </AppShell>
       </UnifiedChatProvider>
     </CapabilityAccessProvider>
   );

@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import stat
 from typing import BinaryIO, Iterator
+from uuid import uuid4
 
 from deeptutor.services.path_service import PathService
 
@@ -161,6 +162,133 @@ def ensure_course_workspace(path_service: PathService, course_id: str) -> bool:
     )
 
 
+def ensure_course_private_directory(
+    path_service: PathService,
+    course_id: str,
+    relative_path: str,
+) -> Path:
+    """Create one Course-owned directory chain with no-follow traversal."""
+    normalized = normalize_artifact_relative_path(relative_path)
+    path_service.get_course_workspace(course_id)
+    components = (
+        *_course_storage_components(path_service),
+        "workspace",
+        "courses",
+        course_id,
+        *normalized.split("/"),
+    )
+    _ensure_directory_chain(path_service, components)
+    return path_service.get_course_workspace(course_id) / normalized
+
+
+def write_course_artifact_atomic(
+    path_service: PathService,
+    course_id: str,
+    relative_path: str,
+    content: bytes,
+) -> None:
+    """Atomically write one Course artifact through no-follow descriptors.
+
+    The operation never opens a caller-derived absolute path. Directory
+    components are created and reopened with ``O_NOFOLLOW``; the temporary
+    file and final rename are relative to the stable parent descriptor.
+    """
+    normalized = normalize_artifact_relative_path(relative_path)
+    if not isinstance(content, bytes):
+        raise InvalidArtifactPathError("Artifact content must be bytes")
+    path_service.get_course_workspace(course_id)
+    _require_handle_relative_storage()
+    parent_components = (
+        *_course_storage_components(path_service),
+        "workspace",
+        "courses",
+        course_id,
+        *normalized.split("/")[:-1],
+    )
+    _ensure_directory_chain(path_service, parent_components)
+    anchor = _prepare_trusted_anchor(path_service)
+    parent_fd = _open_existing_directory_chain(anchor, parent_components)
+    leaf = normalized.split("/")[-1]
+    temporary_name = f".{leaf}.{uuid4().hex}.tmp"
+    temp_fd: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        temp_fd = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+        view = memoryview(content)
+        while view:
+            written = os.write(temp_fd, view)
+            if written <= 0:
+                raise OSError("Course artifact write made no progress")
+            view = view[written:]
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = None
+        os.rename(temporary_name, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            # Some filesystems do not permit directory fsync; the rename is
+            # still atomic and the descriptor boundary remains safe.
+            pass
+    except OSError as exc:
+        raise InvalidArtifactPathError("Course artifact could not be written safely") from exc
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        os.close(parent_fd)
+
+
+def remove_course_artifact(path_service: PathService, course_id: str, relative_path: str) -> None:
+    """Best-effort no-follow removal used to compensate a failed batch."""
+    normalized = normalize_artifact_relative_path(relative_path)
+    path_service.get_course_workspace(course_id)
+    anchor = _prepare_trusted_anchor(path_service)
+    parent_components = (
+        *_course_storage_components(path_service),
+        "workspace",
+        "courses",
+        course_id,
+        *normalized.split("/")[:-1],
+    )
+    parent_fd = _open_existing_directory_chain(anchor, parent_components)
+    try:
+        os.unlink(normalized.split("/")[-1], dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(parent_fd)
+
+
+def remove_empty_course_directory(
+    path_service: PathService,
+    course_id: str,
+    relative_path: str,
+) -> None:
+    """Remove one operation-created empty directory without following links."""
+    normalized = normalize_artifact_relative_path(relative_path)
+    path_service.get_course_workspace(course_id)
+    anchor = _prepare_trusted_anchor(path_service)
+    parent_components = (
+        *_course_storage_components(path_service),
+        "workspace",
+        "courses",
+        course_id,
+        *normalized.split("/")[:-1],
+    )
+    parent_fd = _open_existing_directory_chain(anchor, parent_components)
+    try:
+        try:
+            os.rmdir(normalized.split("/")[-1], dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(parent_fd)
+
+
 def remove_empty_course_workspace(path_service: PathService, course_id: str) -> None:
     """Best-effort rollback of a workspace created by the current operation."""
     path_service.get_course_workspace(course_id)
@@ -228,8 +356,12 @@ __all__ = [
     "InvalidArtifactPathError",
     "UnsupportedCourseStorageError",
     "ensure_course_data_root",
+    "ensure_course_private_directory",
     "ensure_course_workspace",
     "normalize_artifact_relative_path",
     "open_course_artifact_for_read",
+    "remove_course_artifact",
+    "remove_empty_course_directory",
     "remove_empty_course_workspace",
+    "write_course_artifact_atomic",
 ]

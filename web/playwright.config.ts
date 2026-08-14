@@ -5,6 +5,7 @@ const BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE ||
   "http://localhost:3000";
 const SERIAL_MODE = process.env.PW_SERIAL === "1";
+const CHROMIUM_EXECUTABLE = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE;
 
 export default defineConfig({
   testDir: "./tests",
@@ -16,6 +17,7 @@ export default defineConfig({
   use: {
     baseURL: BASE_URL,
     trace: "on-first-retry",
+    ...(CHROMIUM_EXECUTABLE ? { launchOptions: { executablePath: CHROMIUM_EXECUTABLE } } : {}),
   },
   projects: [
     {

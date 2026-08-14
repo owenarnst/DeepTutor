@@ -55,8 +55,8 @@ class _FakeKBManager:
         entry["status"] = status
         entry["progress"] = progress or {}
 
-    def get_default(self) -> str | None:
-        names = self.list_knowledge_bases()
+    def get_default(self, *, available_names: list[str] | None = None) -> str | None:
+        names = available_names if available_names is not None else self.list_knowledge_bases()
         return names[0] if names else None
 
     def get_knowledge_base_path(self, name: str) -> Path:
@@ -140,6 +140,7 @@ def test_rag_providers_lists_llamaindex_and_pageindex() -> None:
         "graphrag",
         "lightrag",
         "lightrag-server",
+        "ima",
     }
     # LlamaIndex works out of the box; PageIndex needs an API key; GraphRAG and
     # LightRAG are optional local engines (no API key, configured = installed).
@@ -151,10 +152,16 @@ def test_rag_providers_lists_llamaindex_and_pageindex() -> None:
     # (the per-KB endpoint is configured at connect time).
     assert by_id["lightrag-server"]["requires_api_key"] is False
     assert by_id["lightrag-server"]["configured"] is True
+    # Same for IMA: a thin HTTPS client, credentials bound per-KB at connect
+    # time rather than gated by one global key.
+    assert by_id["ima"]["requires_api_key"] is False
+    assert by_id["ima"]["configured"] is True
     # Mode-aware engines advertise their retrieval modes; vector engines don't.
     assert "hybrid" in by_id["lightrag"]["modes"]
     assert "mix" in by_id["lightrag-server"]["modes"]
     assert not by_id["llamaindex"].get("modes")
+    # IMA exposes a single retrieval call, so it advertises no modes.
+    assert not by_id["ima"].get("modes")
 
 
 def test_set_rag_provider_mode_persists_validates_and_reflects() -> None:
@@ -496,6 +503,57 @@ def test_list_fallback_reports_error_status(monkeypatch, tmp_path: Path) -> None
     assert item["status"] == "error"
     assert item["progress"]["stage"] == "error"
     assert "get_info" in item["progress"]["error"]
+
+
+def test_list_reuses_manager_config_snapshot(monkeypatch, tmp_path: Path) -> None:
+    class _CountingKBManager:
+        def __init__(self) -> None:
+            self.base_dir = tmp_path / "knowledge_bases"
+            self.base_dir.mkdir(parents=True)
+            self.names = ["kb-a", "kb-b", "kb-c"]
+            self.list_calls = 0
+            self.default_calls = 0
+            self.info_calls: list[tuple[str, bool, str | None]] = []
+
+        def list_knowledge_bases(self) -> list[str]:
+            self.list_calls += 1
+            return self.names
+
+        def get_default(self, *, available_names: list[str] | None = None) -> str:
+            self.default_calls += 1
+            assert available_names == self.names
+            return self.names[0]
+
+        def get_info(
+            self,
+            name: str,
+            *,
+            refresh_config: bool,
+            default_name: str | None,
+        ) -> dict:
+            self.info_calls.append((name, refresh_config, default_name))
+            return {
+                "name": name,
+                "path": str(self.base_dir / name),
+                "is_default": name == default_name,
+                "statistics": {},
+                "metadata": {"name": name},
+                "status": "ready",
+                "progress": None,
+            }
+
+    manager = _CountingKBManager()
+    monkeypatch.setattr(knowledge_router_module, "get_kb_manager", lambda: manager)
+    monkeypatch.setattr(knowledge_router_module, "list_visible_kb_access", lambda: [])
+
+    with TestClient(_build_app()) as client:
+        response = client.get("/api/v1/knowledge/list")
+
+    assert response.status_code == 200
+    assert [item["name"] for item in response.json()] == manager.names
+    assert manager.list_calls == 1
+    assert manager.default_calls == 1
+    assert manager.info_calls == [(name, False, "kb-a") for name in manager.names]
 
 
 def _ready_kb_manager(tmp_path: Path, name: str = "kb") -> "_FakeKBManager":
