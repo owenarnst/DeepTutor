@@ -1,4 +1,4 @@
-"""Mastery Path policy — pure decisions over a :class:`LearningProgress`.
+"""Compatibility façade for the Mastery learning policy.
 
 No LLM calls, no I/O. This is the engine the chat-loop tutor consults each
 turn. It answers three questions:
@@ -19,8 +19,13 @@ reads proven mastery, not a fixed sequence of stages.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import time
 
+from deeptutor.learning.mastery_adapter import (
+    QUALITATIVE_TYPES,
+    QUANTITATIVE_GATE,
+    MasteryLearningAdapter,
+    get_mastery_adapter,
+)
 from deeptutor.learning.models import (
     KnowledgePoint,
     KnowledgeType,
@@ -28,33 +33,15 @@ from deeptutor.learning.models import (
     ReviewTask,
 )
 
-# Quantitative gate for objective knowledge types: the learner must reach this
-# mastery (recency-weighted accuracy; see ``mastery.compute_mastery``) before
-# the objective unlocks. ~0.9 mirrors Alpha School's "90% before you advance".
-QUANTITATIVE_GATE: dict[KnowledgeType, float] = {
-    KnowledgeType.MEMORY: 0.9,
-    KnowledgeType.PROCEDURE: 0.9,
-}
-
-# CONCEPT / DESIGN are gated qualitatively — a Feynman-style explanation judged
-# by the tutor via ``mastery_assess`` — rather than by string-graded accuracy,
-# because there is rarely a single canonical right answer to match against.
-QUALITATIVE_TYPES: frozenset[KnowledgeType] = frozenset(
-    {KnowledgeType.CONCEPT, KnowledgeType.DESIGN}
-)
-
-# Display mastery a qualitative pass maps to, so the map's colours agree with
-# the gate even though qualitative mastery is a boolean, not a score. (The
-# fail-side display is handled in ``LearningService.record_qualitative``.)
-_QUALITATIVE_PASS_DISPLAY = 1.0
+# Historical private constant retained as a read-only compatibility alias;
+# ownership of the value remains in the Mastery adapter.
+_QUALITATIVE_PASS_DISPLAY = MasteryLearningAdapter.gate_threshold(KnowledgeType.CONCEPT)
 
 
 def gate_threshold(kp_type: KnowledgeType) -> float:
     """The quantitative mastery bar for *kp_type* (qualitative types report
     their pass-display value so callers have a single number to show)."""
-    if kp_type in QUALITATIVE_TYPES:
-        return _QUALITATIVE_PASS_DISPLAY
-    return QUANTITATIVE_GATE.get(kp_type, 0.9)
+    return MasteryLearningAdapter.gate_threshold(kp_type)
 
 
 def is_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool:
@@ -63,36 +50,28 @@ def is_mastered(progress: LearningProgress, kp: KnowledgePoint) -> bool:
     * MEMORY / PROCEDURE: recency-weighted accuracy ≥ the type's threshold.
     * CONCEPT / DESIGN: a recorded qualitative pass (``mastery_assess``).
     """
-    if kp.type in QUALITATIVE_TYPES:
-        return bool(progress.qualitative_mastery.get(kp.id, False))
-    return progress.mastery_levels.get(kp.id, 0.0) >= gate_threshold(kp.type)
+    return get_mastery_adapter().is_mastered(progress, kp)
 
 
 def display_mastery(progress: LearningProgress, kp: KnowledgePoint) -> float:
     """A 0..1 number for the map UI. Qualitatively-mastered points show full;
     otherwise the recency-weighted accuracy stands in."""
-    if kp.type in QUALITATIVE_TYPES and progress.qualitative_mastery.get(kp.id):
-        return _QUALITATIVE_PASS_DISPLAY
-    return float(progress.mastery_levels.get(kp.id, 0.0))
+    return get_mastery_adapter().display_mastery(progress, kp)
 
 
 def objective_status(progress: LearningProgress, kp: KnowledgePoint) -> str:
     """``"mastered"`` | ``"learning"`` | ``"new"`` for one knowledge point."""
-    if is_mastered(progress, kp):
-        return "mastered"
-    seen = any(a.knowledge_point_id == kp.id for a in progress.quiz_attempts) or (
-        kp.id in progress.qualitative_mastery
-    )
-    return "learning" if seen else "new"
+    return get_mastery_adapter().objective_status(progress, kp)
 
 
 def due_reviews(progress: LearningProgress, *, now: float | None = None) -> list[ReviewTask]:
     """Spaced-repetition tasks whose ``due_at`` has passed, highest priority
     first. Pure read over ``progress.review_queue`` (built by the scheduler)."""
-    moment = time.time() if now is None else now
-    due = [task for task in progress.review_queue if task.due_at <= moment]
-    due.sort(key=lambda task: task.priority)
-    return due
+    adapter = get_mastery_adapter(progress)
+    return [
+        adapter.to_product_task(item, existing=task)
+        for item, task in adapter.due_review_pairs(now=now)
+    ]
 
 
 @dataclass(frozen=True)
@@ -144,15 +123,11 @@ def find_knowledge_point(
     progress: LearningProgress, kp_id: str
 ) -> tuple[KnowledgePoint | None, str, str]:
     """Return ``(kp, module_id, module_name)`` for *kp_id*, or ``(None, "", "")``."""
-    for module in progress.modules:
-        for kp in module.knowledge_points:
-            if kp.id == kp_id:
-                return kp, module.id, module.name
-    return None, "", ""
+    return get_mastery_adapter().find_knowledge_point(progress, kp_id)
 
 
 def _gate_kind(kp: KnowledgePoint) -> str:
-    return "qualitative" if kp.type in QUALITATIVE_TYPES else "quantitative"
+    return get_mastery_adapter()._gate_kind(kp)
 
 
 def next_objective(progress: LearningProgress, *, now: float | None = None) -> NextStep:
@@ -164,114 +139,28 @@ def next_objective(progress: LearningProgress, *, now: float | None = None) -> N
        the cursor — mastered objectives are skipped);
     4. otherwise the path is complete.
     """
-    pending = progress.pending_question
-    if pending is not None:
-        kp, module_id, module_name = find_knowledge_point(progress, pending.knowledge_point_id)
-        return NextStep(
-            action="answer_pending",
-            module_id=module_id or pending.module_id,
-            module_name=module_name,
-            knowledge_point_id=pending.knowledge_point_id,
-            knowledge_point_name=kp.name if kp else "",
-            knowledge_point_type=kp.type.value if kp else "",
-            status=objective_status(progress, kp) if kp else "learning",
-            gate=_gate_kind(kp) if kp else "",
-            mastery=display_mastery(progress, kp) if kp else 0.0,
-            threshold=gate_threshold(kp.type) if kp else 0.0,
-            reason="A posed question is awaiting the learner's answer; grade it with mastery_grade.",
-            pending_prompt=pending.prompt,
-        )
-
-    due = due_reviews(progress, now=now)
-    if due:
-        kp, module_id, module_name = find_knowledge_point(progress, due[0].knowledge_point_id)
-        if kp is not None:
-            return NextStep(
-                action="review",
-                module_id=module_id,
-                module_name=module_name,
-                knowledge_point_id=kp.id,
-                knowledge_point_name=kp.name,
-                knowledge_point_type=kp.type.value,
-                status=objective_status(progress, kp),
-                gate=_gate_kind(kp),
-                mastery=display_mastery(progress, kp),
-                threshold=gate_threshold(kp.type),
-                reason="This objective is due for spaced-repetition review.",
-            )
-
-    for module in sorted(progress.modules, key=lambda m: m.order):
-        for kp in module.knowledge_points:
-            if is_mastered(progress, kp):
-                continue
-            status = objective_status(progress, kp)
-            gate = _gate_kind(kp)
-            if status == "new":
-                action = "probe"
-            elif gate == "qualitative":
-                action = "assess"
-            else:
-                action = "practice"
-            return NextStep(
-                action=action,
-                module_id=module.id,
-                module_name=module.name,
-                knowledge_point_id=kp.id,
-                knowledge_point_name=kp.name,
-                knowledge_point_type=kp.type.value,
-                status=status,
-                gate=gate,
-                mastery=display_mastery(progress, kp),
-                threshold=gate_threshold(kp.type),
-                reason=(
-                    "Untouched objective — probe first to let the learner test out."
-                    if status == "new"
-                    else "Objective is below its mastery gate; keep working it until it clears."
-                ),
-            )
-
-    return NextStep(action="complete", reason="All objectives are mastered and no reviews are due.")
+    decision = get_mastery_adapter(progress).next_action(now)
+    kp, _module_id, _module_name = find_knowledge_point(progress, decision.objective_id)
+    return NextStep(
+        action=decision.action,
+        module_id=decision.container_id,
+        module_name=decision.container_name,
+        knowledge_point_id=decision.objective_id,
+        knowledge_point_name=decision.objective_name,
+        knowledge_point_type=decision.objective_category,
+        status=decision.status,
+        gate=_gate_kind(kp) if kp else "",
+        mastery=decision.score,
+        threshold=decision.target,
+        reason=decision.reason,
+        pending_prompt=decision.pending_prompt,
+    )
 
 
 def map_summary(progress: LearningProgress, *, now: float | None = None) -> dict:
     """A compact, render-ready snapshot of the whole path for the tutor's
     ``mastery_status`` tool and the dashboard."""
-    counts = {"mastered": 0, "learning": 0, "new": 0, "total": 0}
-    modules_out: list[dict] = []
-    for module in sorted(progress.modules, key=lambda m: m.order):
-        kps_out: list[dict] = []
-        mastered = 0
-        for kp in module.knowledge_points:
-            status = objective_status(progress, kp)
-            counts[status] += 1
-            counts["total"] += 1
-            if status == "mastered":
-                mastered += 1
-            kps_out.append(
-                {
-                    "id": kp.id,
-                    "name": kp.name,
-                    "type": kp.type.value,
-                    "status": status,
-                    "mastery": round(display_mastery(progress, kp), 3),
-                }
-            )
-        modules_out.append(
-            {
-                "id": module.id,
-                "name": module.name,
-                "order": module.order,
-                "mastered": mastered,
-                "total": len(module.knowledge_points),
-                "knowledge_points": kps_out,
-            }
-        )
-    return {
-        "counts": counts,
-        "due_reviews": len(due_reviews(progress, now=now)),
-        "complete": counts["total"] > 0 and counts["mastered"] == counts["total"],
-        "modules": modules_out,
-    }
+    return get_mastery_adapter(progress).map_summary(now=now)
 
 
 __all__ = [

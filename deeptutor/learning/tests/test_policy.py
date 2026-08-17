@@ -142,6 +142,60 @@ def test_next_objective_due_review_beats_new_ground():
     assert step.knowledge_point_id == "kp1"
 
 
+def test_due_reviews_reuses_queued_task_and_state():
+    now = time.time()
+    state = RepetitionState(next_review_at=now - 10)
+    task = ReviewTask(
+        id="r1",
+        knowledge_point_id="kp1",
+        knowledge_type=KnowledgeType.MEMORY,
+        due_at=state.next_review_at,
+        priority=1,
+        state=state,
+    )
+    progress = LearningProgress(book_id="b1", review_queue=[task])
+
+    due = policy.due_reviews(progress, now=now)
+    assert due[0] is task
+    assert due[0].state is state
+
+
+def test_due_reviews_preserves_duplicate_id_positions_and_states_after_reopen():
+    now = time.time()
+    state_one = RepetitionState(next_review_at=now - 20, interval_index=1)
+    state_two = RepetitionState(next_review_at=now - 10, interval_index=2)
+    task_one = ReviewTask(
+        id="duplicate",
+        knowledge_point_id="kp-one",
+        knowledge_type=KnowledgeType.MEMORY,
+        due_at=now - 20,
+        priority=4,
+        state=state_one,
+    )
+    task_two = ReviewTask(
+        id="duplicate",
+        knowledge_point_id="kp-two",
+        knowledge_type=KnowledgeType.DESIGN,
+        due_at=now - 10,
+        priority=1,
+        state=state_two,
+    )
+    progress = LearningProgress(book_id="b1", review_queue=[task_one, task_two])
+
+    due = policy.due_reviews(progress, now=now)
+    assert [task.knowledge_point_id for task in due] == ["kp-two", "kp-one"]
+    assert due[0] is task_two
+    assert due[1] is task_one
+    assert due[0].state is state_two
+    assert due[1].state is state_one
+
+    reopened = LearningProgress.model_validate_json(progress.model_dump_json())
+    reopened_due = policy.due_reviews(reopened, now=now)
+    assert [task.knowledge_point_id for task in reopened_due] == ["kp-two", "kp-one"]
+    assert reopened_due[0] is reopened.review_queue[1]
+    assert reopened_due[1] is reopened.review_queue[0]
+
+
 def test_next_objective_complete_when_all_mastered():
     kp = _kp("kp1", KnowledgeType.MEMORY)
     progress = _progress(kp)

@@ -51,6 +51,32 @@ class TestInitialState:
         assert state.interval_index == 0
         assert abs(state.next_review_at - time.time() - 14 * 86400) < 5
 
+    def test_mutable_debug_mode_changes_initial_and_subsequent_intervals(self, scheduler):
+        scheduler.DEBUG_MODE = False
+        normal_initial = scheduler.get_initial_state(KnowledgeType.DESIGN)
+        assert scheduler.DEBUG_MODE is False
+        assert abs(normal_initial.next_review_at - time.time() - 14 * 86400) < 5
+
+        scheduler.DEBUG_MODE = True
+        debug_initial = scheduler.get_initial_state(KnowledgeType.DESIGN)
+        assert scheduler.DEBUG_MODE is True
+        assert abs(debug_initial.next_review_at - time.time() - 14) < 5
+
+        debug_state = scheduler.schedule_next(
+            RepetitionState(next_review_at=time.time()),
+            KnowledgeType.DESIGN,
+            True,
+        )
+        assert abs(debug_state.next_review_at - time.time() - 28) < 5
+
+        scheduler.DEBUG_MODE = False
+        normal_state = scheduler.schedule_next(
+            RepetitionState(next_review_at=time.time()),
+            KnowledgeType.DESIGN,
+            True,
+        )
+        assert abs(normal_state.next_review_at - time.time() - 28 * 86400) < 5
+
 
 # ── schedule_next: correct advances ──────────────────────────────────────
 
@@ -197,11 +223,88 @@ class TestGetDueTasks:
         due = scheduler.get_due_tasks(lp, max_tasks=3)
         assert len(due) == 3
 
+    def test_duplicate_ids_preserve_sorted_original_tasks_and_states(self, scheduler):
+        now = time.time()
+        state_one = RepetitionState(next_review_at=now - 20, interval_index=1)
+        state_two = RepetitionState(next_review_at=now - 10, interval_index=2)
+        task_one = ReviewTask(
+            id="duplicate",
+            knowledge_point_id="kp-one",
+            knowledge_type=KnowledgeType.MEMORY,
+            due_at=now - 20,
+            priority=4,
+            state=state_one,
+        )
+        task_two = ReviewTask(
+            id="duplicate",
+            knowledge_point_id="kp-two",
+            knowledge_type=KnowledgeType.DESIGN,
+            due_at=now - 10,
+            priority=1,
+            state=state_two,
+        )
+        progress = LearningProgress(book_id="b1", review_queue=[task_one, task_two])
+
+        due = scheduler.get_due_tasks(progress)
+        assert [task.knowledge_point_id for task in due] == ["kp-two", "kp-one"]
+        assert due[0] is task_two
+        assert due[1] is task_one
+        assert due[0].state is state_two
+        assert due[1].state is state_one
+
+        reopened = LearningProgress.model_validate_json(progress.model_dump_json())
+        reopened_due = scheduler.get_due_tasks(reopened)
+        assert [task.knowledge_point_id for task in reopened_due] == ["kp-two", "kp-one"]
+        assert reopened_due[0] is reopened.review_queue[1]
+        assert reopened_due[1] is reopened.review_queue[0]
+
 
 # ── build_review_queue ───────────────────────────────────────────────────
 
 
 class TestBuildReviewQueue:
+    def test_queue_reuses_repetition_state_and_stays_synchronized(self, scheduler):
+        state = RepetitionState(next_review_at=time.time())
+        lp = LearningProgress(book_id="b1")
+        lp.repetition_states["kp1"] = state
+        lp.knowledge_types["kp1"] = KnowledgeType.MEMORY
+
+        queue = scheduler.build_review_queue(lp)
+        assert queue[0].state is state
+
+        scheduler.schedule_next(state, KnowledgeType.MEMORY, True)
+        assert queue[0].state is state
+        assert queue[0].state.interval_index == state.interval_index == 1
+
+    def test_due_tasks_reuse_queued_task_and_state(self, scheduler):
+        state = RepetitionState(next_review_at=time.time() - 10)
+        task = ReviewTask(
+            id="r1",
+            knowledge_point_id="kp1",
+            knowledge_type=KnowledgeType.MEMORY,
+            due_at=state.next_review_at,
+            priority=1,
+            state=state,
+        )
+        lp = LearningProgress(book_id="b1", review_queue=[task])
+
+        due = scheduler.get_due_tasks(lp)
+        assert due[0] is task
+        assert due[0].state is state
+
+    def test_reopen_then_rebuild_rebinds_queue_to_canonical_state(self, scheduler):
+        state = RepetitionState(next_review_at=time.time())
+        progress = LearningProgress(book_id="b1")
+        progress.repetition_states["kp1"] = state
+        progress.knowledge_types["kp1"] = KnowledgeType.MEMORY
+        progress.review_queue = scheduler.build_review_queue(progress)
+
+        reopened = LearningProgress.model_validate_json(progress.model_dump_json())
+        assert reopened.review_queue[0].state is not reopened.repetition_states["kp1"]
+
+        rebuilt = scheduler.build_review_queue(reopened)
+        assert rebuilt[0].state is reopened.repetition_states["kp1"]
+
     def test_error_records_get_priority_1(self, scheduler):
         now = time.time()
         state = RepetitionState(next_review_at=now)

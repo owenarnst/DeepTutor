@@ -10,19 +10,21 @@ Modules:
     prompts     — LLM prompt templates
 """
 
-from deeptutor.learning.models import (
-    DiagnosticResult,
-    ErrorRecord,
-    ErrorType,
-    KnowledgePoint,
-    KnowledgeType,
-    LearningModule,
-    LearningProgress,
-    LearningStage,
-    QuizAttempt,
-    RepetitionState,
-    RetryAttempt,
-    ReviewTask,
+from __future__ import annotations
+
+from importlib import import_module
+
+from deeptutor.learning.kernel import (
+    Evidence,
+    LearningKernel,
+    NextActionDecision,
+    Objective,
+    ObjectiveIdentity,
+    ObjectiveState,
+    ProgressionDecision,
+    ReviewDueState,
+    ReviewItem,
+    ReviewSchedule,
 )
 
 __all__ = [
@@ -38,4 +40,39 @@ __all__ = [
     "RepetitionState",
     "RetryAttempt",
     "ReviewTask",
+    "Evidence",
+    "LearningKernel",
+    "NextActionDecision",
+    "Objective",
+    "ObjectiveIdentity",
+    "ObjectiveState",
+    "ProgressionDecision",
+    "ReviewDueState",
+    "ReviewItem",
+    "ReviewSchedule",
+    "MasteryAdapter",
+    "MasteryLearningAdapter",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily expose historical product exports after a neutral import."""
+
+    if name in {"MasteryAdapter", "MasteryLearningAdapter"}:
+        return getattr(import_module("deeptutor.learning.mastery_adapter"), name)
+    if name in {
+        "DiagnosticResult",
+        "ErrorRecord",
+        "ErrorType",
+        "KnowledgePoint",
+        "KnowledgeType",
+        "LearningModule",
+        "LearningProgress",
+        "LearningStage",
+        "QuizAttempt",
+        "RepetitionState",
+        "RetryAttempt",
+        "ReviewTask",
+    }:
+        return getattr(import_module("deeptutor.learning.models"), name)
+    raise AttributeError(name)
